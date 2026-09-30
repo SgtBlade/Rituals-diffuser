@@ -41,6 +41,18 @@ DiffuserSettings Storage::load() {
     EEPROM.begin(EEPROM_SIZE);
     EEPROM.get(0, settings);
 
+    // v6 -> v7: identical layout; the old reserved fields may still hold
+    // update checker data, so clear them instead of discarding all settings
+    if (settings.magic == SETTINGS_MAGIC_V6) {
+        settings.autoOffHours = 0;  // ensureDefaults() sets the default
+        memset(settings.reserved, 0, sizeof(settings.reserved));
+        settings.rfidWriteUsage = false;
+        settings.magic = SETTINGS_MAGIC;
+        EEPROM.put(0, settings);
+        EEPROM.commit();
+        Serial.println("[STORAGE] Settings migrated to v7");
+    }
+
     // Check magic number
     if (settings.magic != SETTINGS_MAGIC) {
         Serial.println("[STORAGE] No valid settings found, initializing defaults");
@@ -88,6 +100,8 @@ DiffuserSettings Storage::load() {
     settings.nightModeStart = prefs.getUChar(NVS_NIGHT_START, 22);
     settings.nightModeEnd = prefs.getUChar(NVS_NIGHT_END, 7);
     settings.nightModeBrightness = prefs.getUChar(NVS_NIGHT_BRIGHT, 10);
+    settings.rfidWriteUsage = prefs.getBool(NVS_RFID_WRITE, false);
+    settings.autoOffHours = prefs.getUChar(NVS_AUTO_OFF, AUTO_OFF_DEFAULT_HOURS);
 #endif
 
     ensureDefaults(settings);
@@ -121,6 +135,8 @@ void Storage::save(const DiffuserSettings& settings) {
     prefs.putUChar(NVS_NIGHT_START, settings.nightModeStart);
     prefs.putUChar(NVS_NIGHT_END, settings.nightModeEnd);
     prefs.putUChar(NVS_NIGHT_BRIGHT, settings.nightModeBrightness);
+    prefs.putBool(NVS_RFID_WRITE, settings.rfidWriteUsage);
+    prefs.putUChar(NVS_AUTO_OFF, settings.autoOffHours);
 #endif
 
     Serial.println("[STORAGE] Settings saved");
@@ -246,6 +262,9 @@ void Storage::reset() {
 void Storage::ensureDefaults(DiffuserSettings& settings) {
     if (settings.mqttPort == 0) settings.mqttPort = 1883;
     if (settings.fanSpeed == 0) settings.fanSpeed = 50;
+    if (settings.autoOffHours == 0 || settings.autoOffHours > AUTO_OFF_MAX_HOURS) {
+        settings.autoOffHours = AUTO_OFF_DEFAULT_HOURS;
+    }
     if (settings.intervalOnTime < INTERVAL_MIN) settings.intervalOnTime = INTERVAL_ON_DEFAULT;
     if (settings.intervalOffTime < INTERVAL_MIN) settings.intervalOffTime = INTERVAL_OFF_DEFAULT;
     if (strlen(settings.deviceName) == 0) {
@@ -304,6 +323,18 @@ void Storage::setNightMode(bool enabled, uint8_t startHour, uint8_t endHour, uin
     commit();
     Serial.printf("[STORAGE] Night mode: %s (%02d:00-%02d:00, %d%% brightness)\n",
                   enabled ? "ON" : "OFF", startHour, endHour, brightness);
+}
+
+void Storage::setAutoOffHours(uint8_t hours) {
+    _settings.autoOffHours = constrain(hours, 1, AUTO_OFF_MAX_HOURS);
+    commit();
+    Serial.printf("[STORAGE] Auto-off: %u h\n", _settings.autoOffHours);
+}
+
+void Storage::setRfidWriteUsage(bool enabled) {
+    _settings.rfidWriteUsage = enabled;
+    commit();
+    Serial.printf("[STORAGE] Cartridge usage write-back: %s\n", enabled ? "ON" : "OFF");
 }
 
 bool Storage::isNightModeEnabled() {

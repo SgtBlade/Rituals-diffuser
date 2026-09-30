@@ -4,9 +4,10 @@ Custom firmware for the Rituals Perfume Genie diffuser (V1 and V2). Replaces the
 
 <p align="center">
   <img src="docs/images/web-interface.png" alt="Web Interface" width="250"/>
+  <img src="docs/images/desktop.png" alt="Web Interface on desktop" width="520"/>
 </p>
 
-![Version](https://img.shields.io/badge/Version-1.9.9-brightgreen)
+![Version](https://img.shields.io/badge/Version-2.0.0-brightgreen)
 ![ESP32](https://img.shields.io/badge/ESP32-Tested-blue)
 ![ESP32-C3](https://img.shields.io/badge/ESP32--C3-Supported-blue)
 ![ESP8266](https://img.shields.io/badge/ESP8266-Tested-blue)
@@ -21,15 +22,20 @@ Custom firmware for the Rituals Perfume Genie diffuser (V1 and V2). Replaces the
 ## Features
 
 - **Local Control** - No cloud dependency, works offline
-- **Home Assistant Integration** - MQTT auto-discovery
+- **Web Interface** - Warm, app-like UI with a blurred background and glass cards, for phone and desktop. Installable on your home screen (see [Install as an app](#install-as-an-app))
+- **Home Assistant Integration** - MQTT auto-discovery (MQTT is optional: the web interface works on its own)
 - **NFC Scent Detection** - Automatically detects Rituals scent cartridges (v1.9.0+, experimental on ESP8266)
-- **Timer Presets** - 30, 60, 90, 120 minutes + continuous
+- **Cartridge Usage** - Minutes at full speed and first-use date per cartridge, in the original Rituals tag format; optionally saved on the cartridge itself (v2.0.0+)
+- **Timer Presets** - 30, 60, 90, 120 minutes
+- **Auto-Off Failsafe** - Without a timer the fan turns off after 1-4 hours without interaction, so a forgotten diffuser doesn't empty a cartridge (v2.0.0+)
+- **Fan Stall Detection** - Warns in the web interface, LED and Home Assistant when the fan gets power but does not turn (v2.0.0+)
 - **Interval Mode** - Pulsing mode to save fragrance
 - **Night Mode** - Auto-dim LED during configured hours
 - **Usage Statistics** - Track total runtime
+- **Mesh WiFi Aware** - Joins the strongest access point and roams to a better one when the signal gets weak (v2.0.0+)
 - **OTA Updates** - Wireless firmware updates via web interface
 - **Auto-Update** - Checks GitHub for new releases, one-click install (ESP32)
-- **Web Interface** - Clean, responsive UI (phone and desktop, light and dark mode) to control the diffuser and configure WiFi, MQTT and passwords
+- **Self-Healing Filesystem** - An interrupted web interface update never blocks startup; a recovery page lets you upload it again over WiFi (v2.0.0+)
 - **RGB LED Status** - Visual feedback for device state
 - **Physical Buttons** - Front and rear button support
 
@@ -219,12 +225,14 @@ Once installed, you can update wirelessly using one of these methods:
 ### Method 1: Web Interface (Easiest)
 
 1. Open web interface: `http://rituals-diffuser.local` or device IP
-2. Open the **Firmware** tab
+2. Go to **Settings → Firmware**
 3. Upload the firmware `.bin` file
 4. Upload the web interface (filesystem) `.bin` file
 5. Wait for restart
 
-On ESP32 / ESP32-C3 the Firmware tab can also install new releases from GitHub with one click.
+On ESP32 / ESP32-C3 the Firmware page can also install new releases from GitHub with one click.
+
+If an upload is interrupted (for example by a weak WiFi signal), the diffuser keeps working. A failed firmware upload leaves the current firmware in place; a failed web interface upload shows a recovery page where you can upload the file again.
 
 <p align="center">
   <img src="docs/images/firmware-update.png" alt="Firmware Update" width="300"/>
@@ -301,12 +309,14 @@ The device automatically appears in Home Assistant when MQTT auto-discovery is e
 | Interval Mode | Switch | Pulsing mode toggle |
 | Interval On | Number | On-time (10-120 sec) |
 | Interval Off | Number | Off-time (10-120 sec) |
-| Time Left | Sensor | Remaining timer minutes |
+| Time Left | Sensor | Minutes until the fan turns off (timer, or else the auto-off failsafe) |
 | Fan RPM | Sensor | Current fan speed |
+| Fan Problem | Binary Sensor | Fan should run but is not turning (v1.11.1+) |
 | WiFi Signal | Sensor | Signal strength (dBm) |
 | Total Runtime | Sensor | Total device runtime (hours) |
 | Scent | Sensor | Current fragrance name (v1.9.0+) |
 | Cartridge Present | Binary Sensor | NFC cartridge detected (v1.9.0+) |
+| Cartridge Usage | Sensor | Minutes at full speed of the current cartridge, first-use date as attribute (v1.11.1+) |
 
 ### Timer Presets
 
@@ -314,7 +324,7 @@ The device automatically appears in Home Assistant when MQTT auto-discovery is e
 - 60 minutes
 - 90 minutes
 - 120 minutes
-- Continuous
+- Auto: no timer; turns off after the auto-off time (1-4 hours without interaction, default 4)
 
 ## Button Controls
 
@@ -335,7 +345,7 @@ The device automatically appears in Home Assistant when MQTT auto-discovery is e
 
 | Color | Pattern | Status |
 |-------|---------|--------|
-| Red | Blinking | Disconnected / Error |
+| Red | Blinking | Disconnected / Error / fan not turning |
 | Red | Slow blink | Rear button held - factory reset warning |
 | Cyan | Fast blink | Connecting to WiFi |
 | Green | Solid | Fan running |
@@ -344,6 +354,15 @@ The device automatically appears in Home Assistant when MQTT auto-discovery is e
 | Purple | Solid | Interval mode active |
 | Orange | Pulsing | AP mode (WiFi config) |
 | Purple | Fast blink | OTA update in progress |
+
+## Install as an App
+
+The web interface can be added to your phone's home screen and then opens like an app, without browser bars. No MQTT or cloud account is needed; the app talks directly to the diffuser on your home network.
+
+- **iPhone / iPad (Safari):** open the diffuser's address, tap Share → **Add to Home Screen**.
+- **Android (Chrome):** menu → **Add to Home screen**. Chrome only offers a full "Install app" for HTTPS sites; over plain HTTP you get a home screen shortcut. For a full install on your own phone, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add the diffuser's address (e.g. `http://192.168.1.50`) and enable it.
+
+Tip: give the diffuser a fixed IP address in your router and use that address for the home screen icon.
 
 ## Configuration
 
@@ -385,7 +404,8 @@ Outside night hours the LED runs at full brightness.
 4. Fallback: flash via serial connection
 
 ### Fan not spinning
-1. Check wiring connections
+The web interface shows **Fan not turning** (and Home Assistant's `Fan Problem` sensor turns on) when the fan gets power but the tachometer measures no rotation.
+1. Check wiring connections (PWM and tachometer wires, fan connector)
 2. Open Settings → Hardware diagnostics in the web interface
 3. Press "Test" to verify the fan works
 4. Use "Calibrate" or set the minimum PWM if the fan needs a higher starting voltage
@@ -393,6 +413,12 @@ Outside night hours the LED runs at full brightness.
 <p align="center">
   <img src="docs/images/hardware-diagnostics.png" alt="Hardware Diagnostics" width="250"/>
 </p>
+
+### Weak or dropping WiFi (ESP32-C3 in a metal housing)
+The Genie housing is metal and shields WiFi strongly. The ESP32-C3 SuperMini's small antenna can lose 20 dB or more once the cover is on.
+- Check the signal under Settings → WiFi (dBm). Better than -70 dBm is fine; around -80 dBm and weaker is unreliable.
+- Use a board with an external antenna connector and place the antenna outside the metal, or where the original ESP8266 antenna was.
+- With several access points (mesh), the diffuser joins the strongest one and switches when the signal drops below -67 dBm.
 
 ### Can't access 192.168.4.1 (AP mode)
 
@@ -415,10 +441,10 @@ Outside night hours the LED runs at full brightness.
 3. Disable mobile data temporarily
 4. Try a different browser or device
 
-**If you see "Web interface files missing":**
-- You need to flash the filesystem (the web interface files)
-- Download `littlefs_esp8266.bin` (ESP8266) or `spiffs_esp32.bin` (ESP32) from the [latest release](https://github.com/martijnrenkema/Rituals-diffuser/releases)
-- Flash via web interface (Firmware tab) or esptool:
+**If you see "Web interface files are missing or damaged":**
+- The web interface files (filesystem) are missing, for example after an interrupted update
+- Download `littlefs_esp8266.bin` (ESP8266), `spiffs_esp32.bin` (ESP32) or `spiffs_esp32c3.bin` (ESP32-C3) from the [latest release](https://github.com/martijnrenkema/Rituals-diffuser/releases)
+- Upload it on the recovery page itself (ESP32), via Safe Update mode (ESP8266), or with esptool:
   ```bash
   # ESP8266: filesystem offset is 0x1E0000
   esptool.py write_flash 0x1E0000 littlefs_esp8266.bin
@@ -450,16 +476,23 @@ Look for these log messages:
 │   ├── led_controller.*      # WS2812 RGB LED
 │   ├── button_handler.*      # Button input handling
 │   ├── storage.*             # Settings persistence
-│   ├── wifi_manager.*        # WiFi connection
+│   ├── filesystem.*          # Filesystem mount, recovery after failed updates
+│   ├── wifi_manager.*        # WiFi connection, roaming
 │   ├── web_server.*          # Web interface + OTA
 │   ├── mqtt_handler.*        # MQTT + HA discovery
+│   ├── rfid_handler.*        # NFC cartridge reader, usage accounting
+│   ├── update_checker.*      # GitHub release check / auto-update (ESP32)
+│   ├── sync_ota.*            # ESP8266 Safe Update mode
 │   ├── state_lock.*          # Mutex between web handlers and main loop (ESP32)
 │   └── ota_handler.*         # ArduinoOTA
-├── data/                     # Web files (LittleFS on ESP8266, SPIFFS on ESP32)
-│   ├── index.html
-│   ├── update.html         # Redirect to the Firmware tab (old links)
-│   ├── style.css
-│   └── script.js
+├── data_src/                 # Web interface sources
+├── data/                     # Gzipped web files (LittleFS on ESP8266, SPIFFS on ESP32)
+│   ├── index.html.gz
+│   ├── style.css.gz
+│   ├── script.js.gz
+│   ├── manifest.json.gz      # Home screen app manifest
+│   ├── icon-192.png          # App icon
+│   └── update.html.gz        # Redirect to the Firmware page (old links)
 ├── platformio.ini
 └── README.md
 ```
@@ -517,6 +550,43 @@ This project is not affiliated with Rituals Cosmetics. Use at your own risk. Mod
 
 ## Changelog
 
+### v2.0.0
+**New look, installable as an app:**
+- Web interface restyled after the Rituals app: warm blurred background that slowly breathes while the diffuser runs, translucent glass cards, serif typography, cream buttons and sand-coloured switches. Dark only
+- Two tabs, Control and Settings; the firmware page moved under Settings
+- Large on/off button, soft/intense speed slider, clear "Fan not turning" warning, dates like "30 Sep 2026"
+- Smaller type on phones
+- Installable on the home screen (web app manifest, app icon, full-screen on iPhone); see [Install as an App](#install-as-an-app)
+- Still costs no RAM: all web files are served from flash (27 KB gzipped, including the icon)
+
+**Scent detection:**
+- Scent table corrected against the published code list: Happy Buddha, Oriental Vetiver, Black Oudh, Cotton Blossom, Precious Amber, Sweet Jasmine, Imperial Rose, Green Cardamom, Royal Tea and Jing Night were not recognized before
+- Codes are matched at the start of page 4 instead of anywhere in the data, so a code can no longer match at a shifted position
+- Cartridge usage in the original Rituals firmware's format (page 6: minutes at full speed, page 7: first-use date) is shown in the web interface and returned by `/api/status` as `usage_minutes` / `first_use`. The minutes are read from the tag and keep counting while the fan runs (100% speed counts fully, lower speeds proportionally less)
+- Optional: **Settings → Cartridge → Save usage on cartridge** writes these two values back to the tag, like the original firmware, so the usage moves with the cartridge (off by default). Like the original, it writes when a blow period ends (fan off or interval pause), and at most every 10 minutes while the fan blows continuously, to limit tag wear. Only pages 6 and 7 are written, each write is verified, and only on NTAG21x tags where those pages are not locked or password protected; `/api/status` reports `rfid.write_usage` and `rfid.tag_writable`
+- Home Assistant: new `Cartridge Usage` sensor; `Cartridge Present` now uses the plug device class, so it shows plugged in / unplugged instead of home / away
+- ESP32: `/api/status` also returns `legacy_code` (page 4 in the original firmware's code format, for comparison with published lists), and `GET /api/rfid/pages` returns a read-only hex dump of tag pages 0-44
+
+**WiFi:**
+- ESP32: with several access points sharing one SSID (mesh, repeaters), the diffuser now joins the strongest one instead of the first one found on the lowest channel (the ESP8266 already did this)
+- Roaming (ESP32 and ESP8266): while the signal is weaker than -67 dBm, the diffuser scans every 3 minutes and switches to an access point of the same network that is at least 10 dB stronger
+- ESP32: `/api/status` returns the connected access point (`wifi.bssid`) and `wifi.channel`
+- The diffuser registers as `rituals-diffuser` with the router (DHCP hostname), instead of a generic chip name
+
+**Fan:**
+- Auto-off failsafe: without a timer, the fan turns off after 4 hours without any interaction (web, Home Assistant/MQTT or button), so a forgotten diffuser doesn't empty a cartridge. Adjustable from 1 to 4 hours in the Timer card; every interaction restarts the period. The `∞` timer chip is now `Auto`, and Home Assistant's `Time Left` shows the auto-off countdown when no timer is set
+- Stall detection: when the fan should run but the tachometer shows less than 200 RPM for 5 seconds (after 3 seconds of spin-up), the web interface shows "Fan not turning", the LED shows the error state, an error is logged and Home Assistant gets a `Fan Problem` binary sensor
+- RPM is calculated over the time that actually passed, so a delayed loop no longer inflates the reading
+
+**Settings:**
+- Settings format v7 (for the new cartridge and auto-off settings). Existing settings, including WiFi and MQTT, are migrated automatically
+
+**Filesystem robustness:**
+- A failed or interrupted filesystem update (web upload, ArduinoOTA or GitHub update) no longer leaves a half-written partition: it is erased, and a power loss during the update is detected and cleaned up at the next boot. An empty or damaged filesystem never blocks startup
+- When the web interface files are missing, the device shows a recovery page with a filesystem upload (ESP8266: a button to start Safe Update mode), in normal WiFi mode as well as in AP mode
+- A failed ArduinoOTA upload now ends the OTA state (LED, MQTT and log saving resume) instead of waiting for a reboot
+- Logs are saved via a temporary file, so a power loss during a save no longer corrupts the log file
+
 ### v1.11.0
 **New web interface:**
 - Redesigned UI with Control, Settings and Firmware tabs; bottom tab bar on phones, sidebar on desktop
@@ -569,25 +639,5 @@ This project is not affiliated with Rituals Cosmetics. Use at your own risk. Mod
 - New build flags for low-RAM ESP8266 builds: `-DESP8266_LITE=1` (disables NFC + scent lookup, ~4 KB RAM saved), or individually `-DENABLE_NFC=0` / `-DENABLE_SCENT=0`
 - MQTT reconnect backoff: failed broker connects retry at 5s → doubling up to 60s, so an offline broker no longer stalls the main loop (~3s block) every 5 seconds
 - Fix `esp32c3_ota` build environment: missing MFRC522 dependency
-
-### v1.9.9
-**Stability & Cleanup:**
-- MQTT: `removeDiscovery()` now wipes all 13 entities (no more orphans in Home Assistant). Anonymous brokers work again (nullptr instead of empty user/pass).
-- Logger: streams JSON to `/api/logs` instead of buffering (saves ~3 KB heap on ESP8266). Save retries throttled after a failed write.
-- Update checker: ESP8266 retries once per hour after a failed first check. Low-heap floor raised to 18 KB.
-- ESP8266 OTA upload uses `maxSketchSpace` so Update.begin no longer fails on slightly oversized multipart requests.
-- Fan: rejects speed/on/off commands during auto-calibration. Interval times clamped before storage (no more uint8 wrap).
-- RFID: unknown cartridges show "Unknown cartridge" instead of raw bytes. Ambiguous hex matches logged.
-- Night mode brightness changes apply immediately, no longer wait for the next day/night transition.
-
-### v1.9.8
-**Audit Fixes:**
-- Fix MQTT speed/interval persistence: changes via Home Assistant now survive reboot
-- Fix fan speed=0 invalid state: setting speed to 0 now correctly turns off the fan instead of leaving it "on" at 0%
-- Fix update checker error state: error messages now stay visible until next check instead of being instantly cleared
-- Fix OTA auto-prepare on page load: visiting /update.html no longer triggers safe mode automatically on ESP8266
-- Remove broken `esp32c3_rfid_scan` build environment (referenced non-existent source file)
-- Remove unused FastLED dependency from ESP8266 environments (ESP8266 uses NeoPixelBus)
-- Fix ESP32 build error: invalid WiFi TX power constant (WIFI_POWER_20_5dBm → WIFI_POWER_19_5dBm)
 
 For older versions, see [GitHub Releases](https://github.com/martijnrenkema/Rituals-diffuser/releases).

@@ -7,6 +7,25 @@
 #include "update_checker.h"
 #include "state_lock.h"
 
+// Unix time -> "YYYY-MM-DDTHH:MM:SSZ" (UTC). Civil-from-days conversion
+// instead of gmtime()/strftime(), which cost ~660 bytes of RAM on ESP8266.
+static void formatIsoUtc(uint32_t t, char* out, size_t size) {
+    uint32_t secs = t % 86400;
+    int32_t z = (int32_t)(t / 86400) + 719468;
+    int32_t era = z / 146097;
+    uint32_t doe = (uint32_t)(z - era * 146097);
+    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int32_t y = (int32_t)yoe + era * 400;
+    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    uint32_t mp = (5 * doy + 2) / 153;
+    uint32_t d = doy - (153 * mp + 2) / 5 + 1;
+    uint32_t m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y++;
+    snprintf(out, size, "%04ld-%02lu-%02luT%02lu:%02lu:%02luZ", (long)y, (unsigned long)m,
+             (unsigned long)d, (unsigned long)(secs / 3600), (unsigned long)(secs / 60 % 60),
+             (unsigned long)(secs % 60));
+}
+
 // RFID support for all platforms with RC522_ENABLED
 #if defined(RC522_ENABLED)
 #include "rfid_handler.h"
@@ -292,8 +311,12 @@ void MQTTHandler::processPublishStateMachine() {
         case MqttPublishState::STATE_REMAINING:
             {
                 char val[8];
+                // Time until the fan turns off: the timer, or else the
+                // auto-off failsafe
                 snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/remaining_time", base);
-                snprintf(val, sizeof(val), "%u", fanController.getRemainingMinutes());
+                snprintf(val, sizeof(val), "%u", fanController.isTimerActive()
+                         ? fanController.getRemainingMinutes()
+                         : fanController.getAutoOffRemainingMinutes());
                 _mqttClient.publish(_mqttTopic, val, true);
             }
             _publishState = MqttPublishState::STATE_RPM_WIFI;
@@ -308,6 +331,8 @@ void MQTTHandler::processPublishStateMachine() {
                 snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/wifi_signal", base);
                 snprintf(val, sizeof(val), "%d", wifiManager.getRSSI());
                 _mqttClient.publish(_mqttTopic, val, true);
+                snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/fan_problem", base);
+                _mqttClient.publish(_mqttTopic, fanController.isStalled() ? "ON" : "OFF", true);
             }
             _publishState = MqttPublishState::STATE_RUNTIME;
             break;
@@ -351,6 +376,29 @@ void MQTTHandler::processPublishStateMachine() {
                 _mqttClient.publish(_mqttTopic, scent, true);
                 snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/cartridge_present", base);
                 _mqttClient.publish(_mqttTopic, hasCartridge ? "ON" : "OFF", true);
+
+                // Cartridge usage in full-speed minutes, first use as attribute.
+                // Without a cartridge: unknown (HA shows "unknown").
+                char val[12];
+                if (hasCartridge) {
+                    snprintf(val, sizeof(val), "%u", (unsigned)rfidGetUsageMinutes());
+                } else {
+                    strcpy(val, "None");
+                }
+                snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/cartridge_usage", base);
+                _mqttClient.publish(_mqttTopic, val, true);
+
+                char attr[64];
+                uint32_t firstUse = rfidGetFirstUse();
+                if (hasCartridge && firstUse > 0) {
+                    char iso[24];
+                    formatIsoUtc(firstUse, iso, sizeof(iso));
+                    snprintf(attr, sizeof(attr), "{\"first_use\":\"%s\"}", iso);
+                } else {
+                    strcpy(attr, "{\"first_use\":null}");
+                }
+                snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/cartridge_attr", base);
+                _mqttClient.publish(_mqttTopic, attr, true);
             }
             #endif
             _publishState = MqttPublishState::STATE_DONE;
@@ -628,6 +676,23 @@ void MQTTHandler::publishRPMSensorDiscovery() {
     if (!_mqttClient.publish(_mqttTopic, _mqttBuf, true)) {
         Serial.println("[MQTT] RPM sensor discovery publish FAILED");
     }
+
+    // Fan stall: output on but the tachometer shows no rotation
+    snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/binary_sensor/rd_%s_fanprob/config", MQTT_DISCOVERY_PREFIX, id);
+
+    snprintf(_mqttBuf, sizeof(_mqttBuf),
+        "{\"name\":\"Fan Problem\","
+        "\"uniq_id\":\"rd_%s_fanprob\","
+        "\"stat_t\":\"%s/fan_problem\","
+        "\"avty_t\":\"%s/availability\","
+        "\"dev_cla\":\"problem\","
+        "\"ent_cat\":\"diagnostic\","
+        "\"dev\":{\"ids\":[\"rituals_%s\"]}}",
+        id, base, base, id);
+
+    if (!_mqttClient.publish(_mqttTopic, _mqttBuf, true)) {
+        Serial.println("[MQTT] Fan problem sensor discovery publish FAILED");
+    }
 }
 
 void MQTTHandler::publishWiFiSensorDiscovery() {
@@ -774,13 +839,33 @@ void MQTTHandler::publishCartridgeBinarySensorDiscovery() {
         "\"uniq_id\":\"rd_%s_cartridge\","
         "\"stat_t\":\"%s/cartridge_present\","
         "\"avty_t\":\"%s/availability\","
-        "\"dev_cla\":\"presence\","
+        "\"dev_cla\":\"plug\","
         "\"ic\":\"mdi:tag-outline\","
         "\"dev\":{\"ids\":[\"rituals_%s\"]}}",
         id, base, base, id);
 
     if (!_mqttClient.publish(_mqttTopic, _mqttBuf, true)) {
         Serial.println("[MQTT] Cartridge binary sensor discovery publish FAILED");
+    }
+
+    // Cartridge usage: full-speed minutes (original Rituals tag format).
+    // total_increasing: the value drops back when another cartridge is inserted.
+    snprintf(_mqttTopic, sizeof(_mqttTopic), "%s/sensor/rd_%s_cartuse/config", MQTT_DISCOVERY_PREFIX, id);
+
+    snprintf(_mqttBuf, sizeof(_mqttBuf),
+        "{\"name\":\"Cartridge Usage\","
+        "\"uniq_id\":\"rd_%s_cartuse\","
+        "\"stat_t\":\"%s/cartridge_usage\","
+        "\"json_attr_t\":\"%s/cartridge_attr\","
+        "\"avty_t\":\"%s/availability\","
+        "\"unit_of_meas\":\"min\","
+        "\"stat_cla\":\"total_increasing\","
+        "\"ic\":\"mdi:timer-sand\","
+        "\"dev\":{\"ids\":[\"rituals_%s\"]}}",
+        id, base, base, base, id);
+
+    if (!_mqttClient.publish(_mqttTopic, _mqttBuf, true)) {
+        Serial.println("[MQTT] Cartridge usage sensor discovery publish FAILED");
     }
 }
 #else
@@ -802,13 +887,15 @@ void MQTTHandler::removeDiscovery() {
         "number/rd_%s_ioff/config",
         "sensor/rd_%s_rem/config",
         "sensor/rd_%s_rpm/config",
+        "binary_sensor/rd_%s_fanprob/config",
         "sensor/rd_%s_wifi/config",
         "sensor/rd_%s_trun/config",
         "binary_sensor/rd_%s_upd/config",
         "sensor/rd_%s_latver/config",
         "sensor/rd_%s_curver/config",
         "sensor/rd_%s_scent/config",
-        "binary_sensor/rd_%s_cartridge/config"
+        "binary_sensor/rd_%s_cartridge/config",
+        "sensor/rd_%s_cartuse/config"
     };
 
     for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {

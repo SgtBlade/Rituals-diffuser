@@ -2,14 +2,7 @@
 #include "config.h"
 #include <time.h>
 #include <stdarg.h>
-
-#ifdef PLATFORM_ESP8266
-    #include <LittleFS.h>
-    #define FILESYSTEM LittleFS
-#else
-    #include <SPIFFS.h>
-    #define FILESYSTEM SPIFFS
-#endif
+#include "filesystem.h"
 
 Logger logger;
 
@@ -27,33 +20,43 @@ struct LogFileHeader {
 };
 #define LOG_FILE_MAGIC 0x4C4F4731
 
+// Logs are written to a temporary file first and then renamed, so a power
+// loss during a save never leaves a truncated log file behind
+#define LOG_TMP_PATH "/logs.tmp"
+
 void Logger::begin() {
     _head = 0;
     _count = 0;
     _dirty = false;
     _lastSave = 0;
 
-    // Initialize filesystem
-#ifdef PLATFORM_ESP8266
-    if (!LittleFS.begin()) {
-        Serial.println("[LOGGER] LittleFS mount failed");
+    // Mount the filesystem (formats a damaged partition instead of failing)
+    if (fsBegin()) {
+        loadFromFile();
+    } else {
+        Serial.println("[LOGGER] No filesystem, logs are kept in RAM only");
     }
-#else
-    if (!SPIFFS.begin(true)) {
-        Serial.println("[LOGGER] SPIFFS mount failed");
-    }
-#endif
-
-    // Load existing logs from file
-    loadFromFile();
 
     info("Logger initialized");
+    if (fsResetReason() != nullptr) {
+        warn(fsResetReason());
+    }
 }
 
 void Logger::loadFromFile() {
-    File file = FILESYSTEM.open(LOG_FILE_PATH, "r");
+    const char* path = LOG_FILE_PATH;
+    if (!FILESYSTEM.exists(path)) {
+        // Power loss between removing the old file and renaming the new one
+        path = LOG_TMP_PATH;
+        if (!FILESYSTEM.exists(path)) {
+            Serial.println("[LOGGER] No log file found, starting fresh");
+            return;
+        }
+    }
+
+    File file = FILESYSTEM.open(path, "r");
     if (!file) {
-        Serial.println("[LOGGER] No log file found, starting fresh");
+        Serial.println("[LOGGER] Log file unreadable, starting fresh");
         return;
     }
 
@@ -82,6 +85,12 @@ void Logger::loadFromFile() {
             break;
         }
 
+        // The file may be damaged: never trust its strings or enum values
+        entry.message[sizeof(entry.message) - 1] = '\0';
+        if ((int)entry.level < (int)LogLevel::INFO || (int)entry.level > (int)LogLevel::ERROR) {
+            continue;
+        }
+
         // Check retention - skip entries older than 7 days
         time_t now = time(nullptr);
         if (now > 1000000000 && entry.epochTime > 0) {
@@ -103,7 +112,11 @@ void Logger::loadFromFile() {
 }
 
 bool Logger::saveToFile() {
-    File file = FILESYSTEM.open(LOG_FILE_PATH, "w");
+    if (!fsMounted()) {
+        return false;
+    }
+
+    File file = FILESYSTEM.open(LOG_TMP_PATH, "w");
     if (!file) {
         Serial.println("[LOGGER] Failed to open log file for writing");
         return false;
@@ -114,17 +127,31 @@ bool Logger::saveToFile() {
     header.magic = LOG_FILE_MAGIC;
     header.count = _count;
     header.head = _head;
-    file.write((uint8_t*)&header, sizeof(header));
+    size_t expected = sizeof(header) + (size_t)_count * sizeof(LogEntry);
+    size_t written = file.write((uint8_t*)&header, sizeof(header));
 
     // Write entries in order (oldest first)
     for (uint16_t i = 0; i < _count; i++) {
         const LogEntry* entry = getEntry(i);
         if (entry) {
-            file.write((uint8_t*)entry, sizeof(LogEntry));
+            written += file.write((uint8_t*)entry, sizeof(LogEntry));
         }
     }
 
     file.close();
+
+    if (written != expected) {
+        Serial.println("[LOGGER] Log file write incomplete (filesystem full?)");
+        FILESYSTEM.remove(LOG_TMP_PATH);
+        return false;
+    }
+
+    // SPIFFS can't rename onto an existing file
+    FILESYSTEM.remove(LOG_FILE_PATH);
+    if (!FILESYSTEM.rename(LOG_TMP_PATH, LOG_FILE_PATH)) {
+        Serial.println("[LOGGER] Failed to rename log file");
+        return false;
+    }
     _dirty = false;
     _lastSave = millis();
 
@@ -256,7 +283,10 @@ void Logger::clear() {
     _dirty = false;
 
     // Delete log file
-    FILESYSTEM.remove(LOG_FILE_PATH);
+    if (fsMounted()) {
+        FILESYSTEM.remove(LOG_FILE_PATH);
+        FILESYSTEM.remove(LOG_TMP_PATH);
+    }
 
     info("Log cleared");
 }

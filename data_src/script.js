@@ -34,8 +34,10 @@ function showView(){
     const v=(location.hash||'#control').slice(1);
     const name=['control','settings','firmware'].includes(v)?v:'control';
     $$('.view').forEach(el=>el.classList.toggle('hidden',el.id!=='v-'+name));
+    // Firmware lives under Settings: keep that tab highlighted
+    const tab=name==='firmware'?'settings':name;
     $$('.tabs a').forEach(a=>{
-        const on=a.dataset.view===name;
+        const on=a.dataset.view===tab;
         a.classList.toggle('on',on);
         if(on)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current');
     });
@@ -122,6 +124,10 @@ function setRing(speed,on){
     $('.ring').classList.toggle('off',!on);
 }
 
+function fmtMinutes(m){
+    const h=Math.floor(m/60);
+    return (h?h+' h ':'')+(m%60)+' min';
+}
 function updateFan(f){
     if(!f)return;
     state.on=f.on;
@@ -133,15 +139,23 @@ function updateFan(f){
     const p=$('#power');
     p.classList.toggle('on',f.on);
     p.setAttribute('aria-label',f.on?'Turn diffuser off':'Turn diffuser on');
+    $('#power-text').textContent=f.on?'Turn off':'Turn on';
+    // Background breathes while the fan output runs
+    document.body.classList.toggle('running',f.on&&!f.stalled);
+    document.body.classList.toggle('stalled',!!f.stalled);
     if(!dragging){
         $('#speed').value=f.speed;
         $('#speed-val').textContent=f.speed;
         setRing(f.speed,f.on);
     }
-    if(f.rpm!==undefined)$('#rpm-text').textContent=f.on?f.rpm.toLocaleString('en-US')+' rpm':'Standby';
+    const stalled=!!f.stalled;
+    if(f.rpm!==undefined)$('#rpm-text').textContent=stalled?'Not turning':f.on?f.rpm.toLocaleString('en-US')+' rpm':'Standby';
+    $('#rpm-text').classList.toggle('danger',stalled);
 
-    $('#state-title').textContent=f.on?'Diffusing':'Off';
-    $('#state-sub').textContent=!f.on?'Tap to start'
+    $('#state-title').textContent=stalled?'Fan not turning':f.on?'Diffusing':'Off';
+    $('#state-title').classList.toggle('danger',stalled);
+    $('#state-sub').textContent=stalled?'The fan gets power but does not rotate. Check it for a blockage.'
+        :!f.on?'Tap to start'
         :state.intervalMode?'Interval · '+state.intOn+' s on, '+state.intOff+' s off':'Continuous';
 
     $$('.chip').forEach(b=>{
@@ -152,7 +166,9 @@ function updateFan(f){
         b.classList.toggle('on',on);
         b.setAttribute('aria-pressed',on);
     });
-    $('#remaining').textContent=!f.on?'Not running':f.timer_active?'Turns off in '+f.remaining_minutes+' min':'Runs until turned off';
+    $('#remaining').textContent=!f.on?'Not running':f.timer_active?'Turns off in '+f.remaining_minutes+' min'
+        :f.auto_off_minutes?'Turns off automatically in '+fmtMinutes(f.auto_off_minutes):'Runs until turned off';
+    if(f.auto_off_hours&&document.activeElement!==$('#auto-off'))$('#auto-off').value=f.auto_off_hours;
 
     $('#interval').checked=state.intervalMode;
     if(document.activeElement!==$('#int-on'))$('#int-on').value=state.intOn;
@@ -178,6 +194,7 @@ $('#speed').oninput=e=>{
 };
 
 $$('.chip').forEach(b=>b.onclick=()=>cmd({timer:b.dataset.t}));
+$('#auto-off').onchange=e=>cmd({auto_off:e.target.value});
 $('#interval').onchange=e=>cmd({interval:e.target.checked});
 
 let intTimer;
@@ -189,13 +206,40 @@ $('#int-on').onchange=saveInterval;
 $('#int-off').onchange=saveInterval;
 
 // ---------- scent cartridge ----------
+// Pages 6/7 of the tag, written by the original Rituals firmware
+function usageText(r){
+    const parts=[];
+    if(r.usage_minutes>0){
+        const h=Math.floor(r.usage_minutes/60),m=r.usage_minutes%60;
+        parts.push('Used '+(h?h+' h ':'')+m+' min at full speed');
+    }
+    if(r.first_use>0)parts.push('since '+new Date(r.first_use*1000).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'}));
+    return parts.join(' · ');
+}
+function updateCartridgeSetting(r){
+    if(r.write_usage===undefined)return;
+    $('#cart-write').checked=r.write_usage;
+    $('#cart-sum').textContent=!r.write_usage?'Off'
+        :!r.cartridge_present?'On'
+        :r.tag_writable?'On · saving to this cartridge':'On · this cartridge cannot be written';
+}
+$('#cart-write').onchange=async e=>{
+    const on=e.target.checked;
+    try{
+        await post('/api/rfid/settings',{write_usage:on?1:0});
+        $('#cart-sum').textContent=on?'On':'Off';
+        toast(on?'Usage will be saved on the cartridge':'Usage is no longer saved on the cartridge');
+    }catch(err){e.target.checked=!on;toast(err.message,true)}
+};
 function updateRfid(r){
+    updateCartridgeSetting(r);
     const badge=$('#rfid-badge');
     $('#rfid-section').classList.remove('hidden');
     if(r.cartridge_present){
         badge.textContent='Detected';badge.className='badge ok';
         if(r.last_scent)$('#scent-name').textContent=r.last_scent;
-        $('#scent-uid').textContent='';
+        // Usage is only in the full status; the lite poll leaves the line alone
+        if(r.usage_minutes!==undefined)$('#scent-uid').textContent=usageText(r);
     }else if(r.connected){
         badge.textContent='Waiting';badge.className='badge wait';
         if(r.has_tag&&r.last_scent){

@@ -1,6 +1,7 @@
 #include "fan_controller.h"
 #include "config.h"
 #include "storage.h"
+#include "logger.h"
 
 // Helper macro for LEDC write - new API uses pin, old API uses channel
 #if defined(PLATFORM_ESP32) && ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -49,33 +50,41 @@ void FanController::begin() {
     attachInterrupt(digitalPinToInterrupt(FAN_TACHO_PIN), tachoISR, FALLING);
 #endif
 
-    // Load calibration from storage
+    // Load calibration and failsafe from storage
     _minPWM = storage.getFanMinPWM();
+    _autoOffHours = storage.getAutoOffHours();
     Serial.printf("[FAN] Controller initialized (minPWM: %d)\n", _minPWM);
 }
 
 void FanController::loop() {
     unsigned long now = millis();
 
+    accumulateUsage(now);
+
     // Calculate RPM every second (or faster during calibration)
     unsigned long rpmInterval = _calibrating ? 400 : 1000;
-    if (now - _lastRpmCalc >= rpmInterval) {
+    unsigned long elapsed = now - _lastRpmCalc;
+    if (elapsed >= rpmInterval) {
         noInterrupts();
         uint32_t count = _tachoCount;
         _tachoCount = 0;
         interrupts();
 
-        // RPM = (pulses per interval / pulses per revolution) * 60 * (1000/interval)
-        // Simplified: RPM = count * 60000 / (pulses_per_rev * interval_ms)
-        // Use 64-bit intermediate to prevent overflow with high pulse counts
-        if (rpmInterval > 0 && TACHO_PULSES_PER_REV > 0) {
-            uint32_t divisor = TACHO_PULSES_PER_REV * rpmInterval;
-            _rpm = (uint16_t)((uint64_t)count * 60000UL / divisor);
+        // RPM = count * 60000 / (pulses_per_rev * elapsed_ms). Divide by the
+        // time that actually passed: the loop can be late (blocking HTTPS,
+        // MQTT connect), and dividing by the nominal interval would then
+        // overstate the RPM. 64-bit intermediate prevents overflow.
+        if (TACHO_PULSES_PER_REV > 0) {
+            uint64_t divisor = (uint64_t)TACHO_PULSES_PER_REV * elapsed;
+            uint64_t rpm = (uint64_t)count * 60000UL / divisor;
+            _rpm = rpm > 65535 ? 65535 : (uint16_t)rpm;
         }
         _lastRpmCalc = now;
 
         if (_calibrating) {
             Serial.printf("[FAN] RPM calc: count=%lu, rpm=%d\n", (unsigned long)count, _rpm);
+        } else {
+            checkStall();
         }
     }
 
@@ -167,6 +176,16 @@ void FanController::loop() {
         _timerActive = false;
     }
 
+    // Auto-off failsafe: without a timer, switch off after the configured
+    // hours without any interaction
+    if (_isOn && !_timerActive && _autoOffHours > 0 &&
+        now - _lastInteraction >= _autoOffHours * AUTO_OFF_UNIT_MS) {
+        Serial.printf("[FAN] Auto-off after %u h without interaction\n", _autoOffHours);
+        logger.infof("Auto-off after %u h without interaction", _autoOffHours);
+        turnOff();
+        return;
+    }
+
     // Handle interval mode (subtraction handles millis() overflow correctly)
     if (_isOn && _intervalMode && (now - _intervalToggleStart >= _intervalToggleDuration)) {
         if (_intervalCurrentlyOn) {
@@ -196,6 +215,7 @@ void FanController::setSpeed(uint8_t percent) {
 
     if (percent > 100) percent = 100;
     _speed = percent;
+    touch();
 
     // Cancel soft start if active - direct speed change
     _softStartTime = 0;
@@ -225,6 +245,7 @@ void FanController::turnOn() {
         Serial.println("[FAN] turnOn ignored: calibration in progress");
         return;
     }
+    touch();  // Also restarts the failsafe period when already on
     if (!_isOn || _speed == 0) {
         _isOn = true;
         if (_speed == 0) _speed = 50; // Default to 50% if not set
@@ -271,6 +292,13 @@ void FanController::turnOff() {
     _softStartTime = 0;
     _sessionStartTime = 0;
 
+    // Switched off on purpose: a previous stall report no longer applies
+    if (_stalled) {
+        _stalled = false;
+        logger.info("Fan stall cleared (fan turned off)");
+    }
+    _lowRpmSamples = 0;
+
     // Cancel timer when fan is turned off
     if (_timerActive) {
         _timerActive = false;
@@ -286,6 +314,7 @@ bool FanController::isOn() {
 }
 
 void FanController::setTimer(uint16_t minutes) {
+    touch();
     if (minutes > 0) {
         _timerStartTime = millis();
         _timerDuration = minutes * 60000UL;
@@ -296,6 +325,7 @@ void FanController::setTimer(uint16_t minutes) {
 }
 
 void FanController::cancelTimer() {
+    touch();
     _timerActive = false;
     Serial.println("[FAN] Timer cancelled");
 }
@@ -315,6 +345,7 @@ bool FanController::isTimerActive() {
 void FanController::setIntervalMode(bool enabled) {
     bool wasEnabled = _intervalMode;
     _intervalMode = enabled;
+    touch();
 
     if (enabled) {
         // Initialize interval timing - but DON'T auto-start the fan
@@ -344,6 +375,7 @@ bool FanController::isIntervalMode() {
 }
 
 void FanController::setIntervalTimes(uint8_t onSeconds, uint8_t offSeconds) {
+    touch();
     _intervalOnTime = constrain(onSeconds, INTERVAL_MIN, INTERVAL_MAX);
     _intervalOffTime = constrain(offSeconds, INTERVAL_MIN, INTERVAL_MAX);
     Serial.printf("[FAN] Interval times: %ds ON, %ds OFF\n", _intervalOnTime, _intervalOffTime);
@@ -357,8 +389,66 @@ uint8_t FanController::getIntervalOffTime() {
     return _intervalOffTime;
 }
 
+void FanController::setAutoOffHours(uint8_t hours) {
+    _autoOffHours = constrain(hours, 1, AUTO_OFF_MAX_HOURS);
+    touch();
+}
+
+uint16_t FanController::getAutoOffRemainingMinutes() {
+    if (!_isOn || _timerActive || _autoOffHours == 0) return 0;
+    unsigned long limit = _autoOffHours * AUTO_OFF_UNIT_MS;
+    unsigned long elapsed = millis() - _lastInteraction;
+    if (elapsed >= limit) return 0;
+    return (limit - elapsed + 59999) / 60000;  // Round up: "1 min" until it happens
+}
+
 uint16_t FanController::getRPM() {
     return _rpm;
+}
+
+// Called once per RPM sample. Only judged while the output drives the fan and
+// the spin-up grace period has passed; during an interval pause the previous
+// verdict is kept, so a stalled fan isn't reported again every cycle.
+void FanController::checkStall() {
+    if (!_outputOn || millis() - _outputOnSince < FAN_STALL_GRACE_MS) {
+        _lowRpmSamples = 0;
+        return;
+    }
+
+    if (_rpm < FAN_STALL_RPM) {
+        if (_lowRpmSamples < FAN_STALL_SAMPLES) _lowRpmSamples++;
+    } else {
+        _lowRpmSamples = 0;
+    }
+
+    bool stalled = _lowRpmSamples >= FAN_STALL_SAMPLES;
+    if (stalled == _stalled) return;
+    _stalled = stalled;
+
+    if (stalled) {
+        Serial.printf("[FAN] Fan is not turning (RPM %u at %u%%)\n", _rpm, _outputPercent);
+        logger.errorf("Fan is not turning (RPM %u at %u%%)", _rpm, _outputPercent);
+    } else {
+        Serial.printf("[FAN] Fan turning again (RPM %u)\n", _rpm);
+        logger.infof("Fan turning again (RPM %u)", _rpm);
+    }
+    notifyStateChange();  // LED + MQTT
+}
+
+void FanController::accumulateUsage(unsigned long now) {
+    unsigned long dt = now - _lastUsageTick;
+    _lastUsageTick = now;
+    if (_outputOn && !_calibrating && _outputPercent > 1) {
+        _usageWeightedMs += (uint64_t)dt * (_outputPercent - 1);
+    }
+}
+
+uint32_t FanController::takeFullSpeedSeconds() {
+    // 1 full-speed second = 1000 ms at 100% = 1000 * 99 weighted units
+    const uint64_t unit = 1000ULL * 99;
+    uint32_t seconds = (uint32_t)(_usageWeightedMs / unit);
+    _usageWeightedMs -= (uint64_t)seconds * unit;
+    return seconds;
 }
 
 void FanController::onStateChange(StateChangeCallback callback) {
@@ -382,6 +472,16 @@ void FanController::applyPWM(uint8_t percent) {
 
     _currentPWM = pwmValue;
 
+    // Track the effective output for stall detection and usage accounting
+    accumulateUsage(millis());  // Close the period at the old speed
+    bool driving = percent > 0;
+    if (driving && !_outputOn) {
+        _outputOnSince = millis();
+        _lowRpmSamples = 0;
+    }
+    _outputOn = driving;
+    _outputPercent = percent;
+
     Serial.printf("[FAN] PWM: %d%% -> raw=%d (min=%d, invert=%s)\n",
                   percent, pwmValue, _minPWM, _invertPWM ? "yes" : "no");
 
@@ -397,6 +497,12 @@ void FanController::applyPWM(uint8_t percent) {
 void FanController::setRawPWM(uint8_t value) {
     _currentPWM = value;
     Serial.printf("[FAN] Raw PWM set to: %d\n", value);
+
+    // Diagnostic output outside the normal speed mapping: don't judge stalls
+    // or count cartridge usage on it
+    accumulateUsage(millis());
+    _outputOn = false;
+    _lowRpmSamples = 0;
 
 #ifdef PLATFORM_ESP8266
     analogWrite(FAN_PWM_PIN, value);

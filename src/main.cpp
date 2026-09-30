@@ -159,6 +159,12 @@ void updateLedStatus() {
         return;
     }
 
+    // Fan fault: output on but not turning
+    if (fanController.isStalled()) {
+        ledController.showError();
+        return;
+    }
+
     // 5-8. Fan states (only when WiFi is connected)
     if (fanController.isOn()) {
         if (fanController.isTimerActive() && fanController.isIntervalMode()) {
@@ -238,6 +244,14 @@ void onOTAEnd() {
     otaInProgress = false;
     updateLedStatus();
     logger.info("OTA update completed");
+}
+
+// ArduinoOTA failed (connection lost, timeout, ...): leave OTA state so LED,
+// MQTT and log saving return to normal instead of waiting for a reboot
+void onOTAError(int error) {
+    otaInProgress = false;
+    updateLedStatus();
+    logger.warnf("OTA update failed (error %d)", error);
 }
 
 // Button handlers for Rituals Genie
@@ -371,6 +385,7 @@ void setup() {
     // Setup OTA callbacks
     otaHandler.onStart(onOTAStart);
     otaHandler.onEnd(onOTAEnd);
+    otaHandler.onError(onOTAError);
 
     // Initialize RFID (all platforms with RC522_ENABLED)
 #if defined(RC522_ENABLED)

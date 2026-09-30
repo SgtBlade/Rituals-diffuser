@@ -1,6 +1,7 @@
 #include "ota_handler.h"
 #include "config.h"
 #include "storage.h"
+#include "filesystem.h"
 
 OTAHandler otaHandler;
 
@@ -13,6 +14,7 @@ void OTAHandler::loop() {}
 void OTAHandler::onProgress(OTACallback callback) { _progressCallback = callback; }
 void OTAHandler::onStart(void (*callback)()) { _startCallback = callback; }
 void OTAHandler::onEnd(void (*callback)()) { _endCallback = callback; }
+void OTAHandler::onError(void (*callback)(int error)) { _errorCallback = callback; }
 
 #else
 
@@ -23,13 +25,16 @@ void OTAHandler::begin() {
     ArduinoOTA.setPassword(storage.getOTAPassword());
 
     ArduinoOTA.onStart([this]() {
-        String type;
-        if (ArduinoOTA.getCommand() == U_FLASH) {
-            type = "firmware";
-        } else {
-            type = "filesystem";
+        _active = true;
+        _fsUpdate = (ArduinoOTA.getCommand() != U_FLASH);
+        _bytesReceived = 0;
+        Serial.printf("[OTA] Start updating %s\n", _fsUpdate ? "filesystem" : "firmware");
+
+        if (_fsUpdate) {
+            // The partition is being overwritten: unmount it and record the
+            // update, so an interrupted upload is detected at the next boot
+            fsUpdateStart();
         }
-        Serial.println("[OTA] Start updating " + type);
 
         if (_startCallback) {
             _startCallback();
@@ -38,6 +43,11 @@ void OTAHandler::begin() {
 
     ArduinoOTA.onEnd([this]() {
         Serial.println("\n[OTA] Update complete");
+        _active = false;
+        if (_fsUpdate) {
+            fsUpdateEnd(true, _bytesReceived);
+            _fsUpdate = false;
+        }
 
         if (_endCallback) {
             _endCallback();
@@ -45,6 +55,7 @@ void OTAHandler::begin() {
     });
 
     ArduinoOTA.onProgress([this](unsigned int progress, unsigned int total) {
+        _bytesReceived = progress;
         int percent = (total > 0) ? ((progress * 100) / total) : 0;
         Serial.printf("[OTA] Progress: %u%%\r", percent);
 
@@ -53,13 +64,27 @@ void OTAHandler::begin() {
         }
     });
 
-    ArduinoOTA.onError([](ota_error_t error) {
+    ArduinoOTA.onError([this](ota_error_t error) {
         Serial.printf("[OTA] Error[%u]: ", error);
         if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
         else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
         else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
         else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
         else if (error == OTA_END_ERROR) Serial.println("End Failed");
+
+        // Errors before onStart (auth, begin failed because another update
+        // is running) must not touch that other update's state. After a
+        // connect error ArduinoOTA also reports an end error: handle once.
+        if (!_active) return;
+        _active = false;
+
+        if (_fsUpdate) {
+            _fsUpdate = false;
+            fsUpdateEnd(false, _bytesReceived);
+        }
+        if (_errorCallback) {
+            _errorCallback((int)error);
+        }
     });
 
     ArduinoOTA.begin();
@@ -80,6 +105,10 @@ void OTAHandler::onStart(void (*callback)()) {
 
 void OTAHandler::onEnd(void (*callback)()) {
     _endCallback = callback;
+}
+
+void OTAHandler::onError(void (*callback)(int error)) {
+    _errorCallback = callback;
 }
 
 #endif

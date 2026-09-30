@@ -5,6 +5,10 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include "mqtt_handler.h"  // For state publish on cartridge change
+#include "fan_controller.h"
+#include "storage.h"
+#include "logger.h"
+#include <time.h>
 
 // RC522 instance
 static MFRC522* mfrc522 = nullptr;
@@ -16,6 +20,26 @@ static uint8_t rc522VersionReg = 0;  // Store version for debug
 static char lastUID[24] = "";           // UID max ~14 chars for 7-byte UID + null
 static char lastScent[48] = "";         // Scent name
 static char lastScentCode[12] = "";     // 8 hex chars + null
+static uint32_t lastUsageMinutes = 0;    // Page 6: full-speed minutes (tag value + our count)
+static uint32_t lastFirstUse = 0;        // Page 7: first-use Unix time (0 = never set)
+
+// Cartridge usage accounting, compatible with the original firmware:
+// page 6 = cumulative full-speed minutes, page 7 = Unix time of first use,
+// both big-endian u32. Written only when enabled in the settings.
+#define USAGE_PAGE          6
+#define FIRST_USE_PAGE      7
+#define USAGE_WRITE_INTERVAL_MS 600000UL  // While blowing continuously: at most every 10 min
+#define MAX_WRITE_FAILURES  3               // Then stop writing to this cartridge
+#define CLOCK_VALID_EPOCH   1600000000UL    // time() below this: NTP not synced yet
+static bool usageValid = false;          // Pages 6/7 of the current cartridge were read
+static bool tagWritable = false;         // Current cartridge accepts writes to pages 6/7
+static uint8_t writeFailures = 0;
+static uint32_t usageOnTag = 0;          // Page-6 value last read from / written to the tag
+static uint32_t pendingSeconds = 0;      // Full-speed seconds not yet counted as a minute
+static unsigned long lastUsageWrite = 0; // millis() of the last page-6 write
+#ifndef PLATFORM_ESP8266
+static char lastPagesHex[48 * 8 + 1] = "";  // Read-only dump of pages 0-47 (ESP32 only)
+#endif
 static unsigned long lastTagTime = 0;
 static unsigned long lastScanTime = 0;
 static bool hasValidTag = false;
@@ -27,124 +51,144 @@ static bool cartridgePresent = false;
 #define SCAN_INTERVAL_MS 1000
 
 #if ENABLE_SCENT
-// Geurtabel - officieel gedeeld
+// Scent table, keyed on the raw page-4 bytes of the cartridge tag.
 // Stored in PROGMEM: fixed-size entries so the whole table (incl. strings)
 // lives in flash instead of DRAM (~2KB saved on ESP8266).
+//
+// Published scents store three ASCII characters followed by 0x00 in page 4.
+// The codes in the published list use the original firmware's encoding
+// ("0" + each byte as unpadded lowercase hex, sometimes without the leading
+// "0"); the entries below are the corresponding raw bytes. 6-char entries
+// match the first three bytes, 8-char entries match all four bytes.
 struct ScentEntry {
-    char uid[9];       // UID prefix als hex (max 8 chars + null)
-    char name[38];     // Geurnaam (langste is 35 chars + null)
+    char code[9];      // Page-4 hex prefix (6 or 8 chars + null)
+    char name[38];     // Scent name (longest is 35 chars + null)
 };
 
-// Geurtabel met hex codes - zowel 3-letter ASCII als officiële codes
-// Elke geur heeft lowercase, uppercase (capitalized) en officiële hex varianten
 static const ScentEntry scentTable[] PROGMEM = {
-    // ============ KARMA ============
-    {"6B6172", "The Ritual of Karma"},           // "kar" ASCII lowercase
-    {"4B6172", "The Ritual of Karma"},           // "Kar" ASCII uppercase
-    {"06B617", "The Ritual of Karma"},           // Officieel (alternatief)
+    // The Rituals
+    {"6B6172", "The Ritual of Karma"},                  // "kar"
+    {"44616F", "The Ritual of Dao"},                    // "Dao"
+    {"4C6175", "The Ritual of Happy Buddha"},           // "Lau"
+    {"53616B", "The Ritual of Sakura"},                 // "Sak"
+    {"417975", "The Ritual of Ayurveda"},               // "Ayu"
+    {"48616D", "The Ritual of Hammam"},                 // "Ham"
+    {"4A696E", "The Ritual of Jing"},                   // "Jin"
+    {"6D6568", "The Ritual of Mehr"},                   // "meh"
+    {"537072", "The Ritual of Spring Garden"},          // "Spr"
+    {"477375", "The Ritual of Jing Night"},             // "Gsu"
+    {"02D63620", "The Ritual of Yozakura"},             // Observed on a real cartridge
 
-    // ============ DAO ============
-    {"64616F", "The Ritual of Dao"},             // "dao" ASCII lowercase
-    {"44616F", "The Ritual of Dao"},             // "Dao" ASCII uppercase
-    {"044616", "The Ritual of Dao"},             // Officieel
-
-    // ============ HAPPY BUDDHA ============
-    {"686170", "The Ritual of Happy Buddha"},    // "hap" ASCII lowercase
-    {"486170", "The Ritual of Happy Buddha"},    // "Hap" ASCII uppercase
-    {"04C617", "The Ritual of Happy Buddha"},    // Officieel
-
-    // ============ SAKURA ============
-    {"73616B", "The Ritual of Sakura"},          // "sak" ASCII lowercase
-    {"53616B", "The Ritual of Sakura"},          // "Sak" ASCII uppercase
-    {"053616", "The Ritual of Sakura"},          // Officieel
-
-    // ============ AYURVEDA ============
-    {"617975", "The Ritual of Ayurveda"},        // "ayu" ASCII lowercase
-    {"417975", "The Ritual of Ayurveda"},        // "Ayu" ASCII uppercase
-    {"047975", "The Ritual of Ayurveda"},        // Officieel
-
-    // ============ HAMMAM ============
-    {"68616D", "The Ritual of Hammam"},          // "ham" ASCII lowercase
-    {"48616D", "The Ritual of Hammam"},          // "Ham" ASCII uppercase
-    {"048616", "The Ritual of Hammam"},          // Officieel
-
-    // ============ JING ============
-    {"6A696E", "The Ritual of Jing"},            // "jin" ASCII lowercase
-    {"4A696E", "The Ritual of Jing"},            // "Jin" ASCII uppercase
-    {"04A696", "The Ritual of Jing"},            // Officieel
-
-    // ============ MEHR ============
-    {"6D6568", "The Ritual of Mehr"},            // "meh" ASCII lowercase
-    {"4D6568", "The Ritual of Mehr"},            // "Meh" ASCII uppercase
-    {"06D656", "The Ritual of Mehr"},            // Officieel
-
-    // ============ SPRING GARDEN ============
-    {"737072", "The Ritual of Spring Garden"},   // "spr" ASCII lowercase
-    {"537072", "The Ritual of Spring Garden"},   // "Spr" ASCII uppercase
-    {"057072", "The Ritual of Spring Garden"},   // Officieel
-
-    // ============ PRIVATE COLLECTION ============
-    {"676F6A", "Private Collection Goji Berry"},          // "goj" ASCII lowercase
-    {"476F6A", "Private Collection Goji Berry"},          // "Goj" ASCII uppercase
-    {"0476F6", "Private Collection Goji Berry"},          // Officieel
-
-    {"766574", "Private Collection Oriental Vetiver"},    // "vet" ASCII lowercase
-    {"566574", "Private Collection Oriental Vetiver"},    // "Vet" ASCII uppercase
-    {"04F726", "Private Collection Oriental Vetiver"},    // Officieel
-
-    {"6F7564", "Private Collection Black Oudh"},          // "oud" ASCII lowercase
-    {"4F7564", "Private Collection Black Oudh"},          // "Oud" ASCII uppercase
-    {"0426C6", "Private Collection Black Oudh"},          // Officieel
-
-    {"616D62", "Private Collection Precious Amber"},      // "amb" ASCII lowercase
-    {"416D62", "Private Collection Precious Amber"},      // "Amb" ASCII uppercase
-    {"057265", "Private Collection Precious Amber"},      // Officieel
-
-    {"6A6173", "Private Collection Sweet Jasmine"},       // "jas" ASCII lowercase
-    {"4A6173", "Private Collection Sweet Jasmine"},       // "Jas" ASCII uppercase
-    {"057765", "Private Collection Sweet Jasmine"},       // Officieel
-
-    {"726F73", "Private Collection Imperial Rose"},       // "ros" ASCII lowercase
-    {"526F73", "Private Collection Imperial Rose"},       // "Ros" ASCII uppercase
-    {"0496D7", "Private Collection Imperial Rose"},       // Officieel
-
-    {"736176", "Private Collection Savage Garden"},       // "sav" ASCII lowercase
-    {"536176", "Private Collection Savage Garden"},       // "Sav" ASCII uppercase
-    {"056176", "Private Collection Savage Garden"},       // Officieel
-
-    {"76616E", "Private Collection Suede Vanilla"},       // "van" ASCII lowercase
-    {"56616E", "Private Collection Suede Vanilla"},       // "Van" ASCII uppercase
-    {"056616", "Private Collection Suede Vanilla"},       // Officieel
-
-    {"636F74", "Private Collection Cotton Blossom"},      // "cot" ASCII lowercase
-    {"436F74", "Private Collection Cotton Blossom"},      // "Cot" ASCII uppercase
-    // NOTE: Official hex code for Cotton Blossom needs verification
-    // Previous value "0426C6" was duplicate of Black Oudh - removed to prevent misidentification
-    // ASCII codes "cot"/"Cot" still work for cartridge detection
-
-    {"636172", "Private Collection Green Cardamom"},      // "car" ASCII lowercase
-    {"436172", "Private Collection Green Cardamom"},      // "Car" ASCII uppercase
-    {"047265", "Private Collection Green Cardamom"},      // Officieel
-
-    {"746561", "Private Collection Royal Tea"},           // "tea" ASCII lowercase
-    {"546561", "Private Collection Royal Tea"},           // "Tea" ASCII uppercase
-    {"047275", "Private Collection Royal Tea"},           // Officieel
-
-    // ============ YOZAKURA ============
-    {"796F7A", "The Ritual of Yozakura"},        // "yoz" ASCII lowercase (speculative)
-    {"596F7A", "The Ritual of Yozakura"},        // "Yoz" ASCII uppercase (speculative)
-    {"02D63620", "The Ritual of Yozakura"},      // Page-4 hex observed on real cartridge
-
-    // ============ JING NIGHT ============
-    {"6E6967", "The Ritual of Jing Night"},      // "nig" ASCII lowercase
-    {"4E6967", "The Ritual of Jing Night"},      // "Nig" ASCII uppercase
-    {"047375", "The Ritual of Jing Night"},      // Officieel
-
-    // ============ INVALID ============
-    {"013A0C", "Cartridge tag invalid"},         // Officieel
+    // Private Collection
+    {"476F6A", "Private Collection Goji Berry"},        // "Goj"
+    {"4F7269", "Private Collection Oriental Vetiver"},  // "Ori"
+    {"426C61", "Private Collection Black Oudh"},        // "Bla"
+    {"507265", "Private Collection Precious Amber"},    // "Pre"
+    {"537765", "Private Collection Sweet Jasmine"},     // "Swe"
+    {"496D70", "Private Collection Imperial Rose"},     // "Imp"
+    {"536176", "Private Collection Savage Garden"},     // "Sav"
+    {"56616E", "Private Collection Suede Vanilla"},     // "Van"
+    {"426C6F", "Private Collection Cotton Blossom"},    // "Blo"
+    {"477265", "Private Collection Green Cardamom"},    // "Gre"
+    {"477275", "Private Collection Royal Tea"},         // "Gru"
 };
 #define SCENT_TABLE_COUNT (sizeof(scentTable) / sizeof(scentTable[0]))
 #endif // ENABLE_SCENT
+
+static inline uint32_t readBigEndian32(const byte* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+// Configuration page (CFG0) of NTAG213/215/216, from the capability container
+// data-area size byte. 0 = not an NTAG21x we know.
+static byte ntagConfigPage(byte ccSize) {
+    switch (ccSize) {
+        case 0x12: return 41;   // NTAG213
+        case 0x3E: return 131;  // NTAG215
+        case 0x6D: return 227;  // NTAG216
+        default:   return 0;
+    }
+}
+
+// Can pages 6 and 7 of the selected tag be written without a password?
+// Requires an NTAG21x whose static lock bits leave pages 6/7 open and whose
+// AUTH0 does not cover them. Passwords are never tried: NTAG21x can limit
+// failed attempts and lock itself.
+static bool checkTagWritable() {
+    if (mfrc522->uid.sak != 0x00) return false;  // Not Ultralight/NTAG
+
+    byte buf[18];
+    byte size = sizeof(buf);
+    if (mfrc522->MIFARE_Read(0, buf, &size) != MFRC522::STATUS_OK) return false;
+    // Page 2, byte 2: static lock bits, bit n locks page n (4..7)
+    if (buf[10] & ((1 << USAGE_PAGE) | (1 << FIRST_USE_PAGE))) return false;
+    // Page 3: capability container
+    if (buf[12] != 0xE1) return false;
+    byte cfgPage = ntagConfigPage(buf[14]);
+    if (cfgPage == 0) return false;
+
+    size = sizeof(buf);
+    if (mfrc522->MIFARE_Read(cfgPage, buf, &size) != MFRC522::STATUS_OK) return false;
+    // CFG0 byte 3 = AUTH0: first page that needs password authentication
+    return buf[3] > FIRST_USE_PAGE;
+}
+
+// Write a big-endian u32 to page 6 or 7 and read it back. Refuses every
+// other page: the scent code and tag configuration must never be touched.
+static bool writeTagPage(byte page, uint32_t value) {
+    if (page != USAGE_PAGE && page != FIRST_USE_PAGE) return false;
+
+    byte data[4] = { (byte)(value >> 24), (byte)(value >> 16), (byte)(value >> 8), (byte)value };
+    if (mfrc522->MIFARE_Ultralight_Write(page, data, sizeof(data)) != MFRC522::STATUS_OK) {
+        return false;
+    }
+    byte buf[18];
+    byte size = sizeof(buf);
+    if (mfrc522->MIFARE_Read(page, buf, &size) != MFRC522::STATUS_OK) return false;
+    return memcmp(buf, data, sizeof(data)) == 0;
+}
+
+static void noteWriteResult(bool ok, const char* what) {
+    if (ok) {
+        writeFailures = 0;
+        return;
+    }
+    writeFailures++;
+    Serial.printf("[RFID] Writing %s failed (%u/%u)\n", what, writeFailures, MAX_WRITE_FAILURES);
+    if (writeFailures >= MAX_WRITE_FAILURES) {
+        logger.warn("Cartridge write failed, usage no longer saved on this cartridge");
+    }
+}
+
+// Card is selected: bring pages 6/7 up to date if enabled and possible
+static void updateTagUsage() {
+    if (!usageValid || !tagWritable || writeFailures >= MAX_WRITE_FAILURES) return;
+    if (!storage.isRfidWriteUsage()) return;
+
+    // First use: stamped once, as soon as the clock is valid
+    time_t now = time(nullptr);
+    if (lastFirstUse == 0 && now > (time_t)CLOCK_VALID_EPOCH) {
+        bool ok = writeTagPage(FIRST_USE_PAGE, (uint32_t)now);
+        noteWriteResult(ok, "first use");
+        if (!ok) return;
+        lastFirstUse = (uint32_t)now;
+        Serial.printf("[RFID] First use stamped: %u\n", (unsigned)lastFirstUse);
+    }
+
+    // Like the original, write when a blow period ends (fan off or interval
+    // pause); while the fan blows continuously at most every 10 minutes.
+    // Keeps tag wear low: NTAG21x endures about 100,000 writes per page.
+    bool periodEnded = !fanController.isOutputOn();
+    bool intervalDue = millis() - lastUsageWrite >= USAGE_WRITE_INTERVAL_MS;
+    if (lastUsageMinutes > usageOnTag && (periodEnded || intervalDue)) {
+        bool ok = writeTagPage(USAGE_PAGE, lastUsageMinutes);
+        noteWriteResult(ok, "usage");
+        if (!ok) return;
+        usageOnTag = lastUsageMinutes;
+        lastUsageWrite = millis();
+        Serial.printf("[RFID] Usage written: %u min\n", (unsigned)usageOnTag);
+    }
+}
 
 bool rfidInit() {
     Serial.println("[RFID] Initializing RC522...");
@@ -273,6 +317,17 @@ void rfidLoop() {
     }
     lastScanTime = now;
 
+    // Count fan use for the cartridge that is in the diffuser. Without one
+    // (or with unreadable usage pages) the time is dropped.
+    uint32_t fullSpeedSeconds = fanController.takeFullSpeedSeconds();
+    if (cartridgePresent && usageValid) {
+        pendingSeconds += fullSpeedSeconds;
+        if (pendingSeconds >= 60) {
+            lastUsageMinutes += pendingSeconds / 60;
+            pendingSeconds %= 60;
+        }
+    }
+
     // Check voor kaart (nieuw of bestaand)
     if (!mfrc522->PICC_IsNewCardPresent()) {
         // Probeer bestaande kaart opnieuw te wekken
@@ -322,6 +377,7 @@ void rfidLoop() {
 
     // Als het dezelfde kaart is, alleen timestamp updaten en stoppen
     if (!isNewCard) {
+        updateTagUsage();
         // Halt PICC om stroom te besparen
         mfrc522->PICC_HaltA();
         return;
@@ -364,6 +420,11 @@ void rfidLoop() {
 
         Serial.printf("[RFID] Page 4: %s (ASCII: %s)\n", page4Hex, page4Ascii);
 
+        // MIFARE_Read returned pages 4-7: pages 6 and 7 hold usage data
+        lastUsageMinutes = readBigEndian32(&buffer[8]);
+        lastFirstUse = readBigEndian32(&buffer[12]);
+        usageValid = true;
+
         // Lookup scent
         ScentInfo info = rfidLookupScent(page4Hex);
         if (info.valid) {
@@ -380,6 +441,10 @@ void rfidLoop() {
         }
     } else {
         Serial.printf("[RFID] Read failed: %d\n", status);
+        lastScentCode[0] = '\0';
+        lastUsageMinutes = 0;
+        lastFirstUse = 0;
+        usageValid = false;
         strncpy(lastScent, "Read Error", sizeof(lastScent) - 1);
         lastScent[sizeof(lastScent) - 1] = '\0';
     }
@@ -426,6 +491,8 @@ void rfidLoop() {
 
     // Show combined data for easy pattern matching
     allHex.toUpperCase();
+    strncpy(lastPagesHex, allHex.c_str(), sizeof(lastPagesHex) - 1);
+    lastPagesHex[sizeof(lastPagesHex) - 1] = '\0';
     Serial.println("\n--- Combined hex (for pattern search) ---");
     Serial.println(allHex);
     Serial.println("\n--- Combined ASCII ---");
@@ -451,6 +518,17 @@ void rfidLoop() {
         Serial.printf("[RFID] Page 4 hex: %s (ASCII: %s)\n", page4Hex.c_str(), page4Ascii.c_str());
     } else {
         Serial.println("[RFID] ERROR: Could not extract page 4 data");
+        lastScentCode[0] = '\0';
+    }
+
+    // Pages 6 and 7 hold usage data (characters 48-63 of the hex dump)
+    lastUsageMinutes = 0;
+    lastFirstUse = 0;
+    usageValid = false;
+    if (allHex.length() >= 64) {
+        lastUsageMinutes = strtoul(allHex.substring(48, 56).c_str(), nullptr, 16);
+        lastFirstUse = strtoul(allHex.substring(56, 64).c_str(), nullptr, 16);
+        usageValid = true;
     }
 
     // Lookup geur based on hex code from page 4
@@ -468,6 +546,20 @@ void rfidLoop() {
                       page4Hex.c_str(), page4Ascii.c_str());
     }
 #endif
+
+    if (lastUsageMinutes != 0 || lastFirstUse != 0) {
+        Serial.printf("[RFID] Tag usage: %u min, first use %u\n",
+                      (unsigned)lastUsageMinutes, (unsigned)lastFirstUse);
+    }
+
+    // Usage accounting starts from the tag's own value
+    usageOnTag = lastUsageMinutes;
+    pendingSeconds = 0;
+    writeFailures = 0;
+    lastUsageWrite = millis();
+    tagWritable = usageValid && checkTagWritable();
+    Serial.printf("[RFID] Usage pages writable: %s\n", tagWritable ? "yes" : "no");
+    updateTagUsage();
 
     // Notify MQTT of new cartridge
     mqttHandler.requestStatePublish();
@@ -491,6 +583,40 @@ const char* rfidGetLastScentCStr() {
 
 const char* rfidGetLastScentCode() {
     return lastScentCode;
+}
+
+uint32_t rfidGetUsageMinutes() {
+    return lastUsageMinutes;
+}
+
+uint32_t rfidGetFirstUse() {
+    return lastFirstUse;
+}
+
+bool rfidIsTagWritable() {
+    return tagWritable && writeFailures < MAX_WRITE_FAILURES;
+}
+
+void rfidFormatLegacyCode(const char* hex, char* out, size_t outSize) {
+    // Original firmware encoding: "0" followed by each page-4 byte as
+    // lowercase hex without zero padding. Lossy, only for comparison with
+    // published code lists.
+    if (outSize == 0) return;
+    out[0] = '\0';
+    if (strlen(hex) != 8) return;
+    size_t pos = snprintf(out, outSize, "0");
+    for (int i = 0; i < 4 && pos < outSize; i++) {
+        char byteHex[3] = { hex[i * 2], hex[i * 2 + 1], '\0' };
+        pos += snprintf(out + pos, outSize - pos, "%lx", strtoul(byteHex, nullptr, 16));
+    }
+}
+
+const char* rfidGetLastPagesHex() {
+#ifndef PLATFORM_ESP8266
+    return lastPagesHex;
+#else
+    return "";
+#endif
 }
 
 bool rfidHasTag() {
@@ -528,23 +654,17 @@ ScentInfo rfidLookupScent(const String& hexData) {
     }
 
 #if ENABLE_SCENT
-    // Search for hex codes in the tag data. Continue searching after the first
-    // hit so we can warn when a tag matches multiple table entries with
-    // *different* scent names (would indicate an ambiguous/incorrect entry).
+    // Match each entry against the start of the page-4 hex (no substring
+    // search: a code could otherwise match at a shifted nibble position).
     // Table lives in PROGMEM - copy each entry to stack before comparing.
     for (size_t i = 0; i < SCENT_TABLE_COUNT; i++) {
         ScentEntry entry;
         memcpy_P(&entry, &scentTable[i], sizeof(entry));
-        if (strstr(data, entry.uid) != nullptr) {
-            if (!info.valid) {
-                info.name = String(entry.name);
-                info.valid = true;
-                Serial.printf("[RFID] Found hex pattern: %s -> %s\n",
-                              entry.uid, entry.name);
-            } else if (strcmp(info.name.c_str(), entry.name) != 0) {
-                Serial.printf("[RFID] WARNING: ambiguous match - %s also matches %s\n",
-                              entry.uid, entry.name);
-            }
+        if (strncmp(data, entry.code, strlen(entry.code)) == 0) {
+            info.name = String(entry.name);
+            info.valid = true;
+            Serial.printf("[RFID] Found scent code: %s -> %s\n", entry.code, entry.name);
+            break;
         }
     }
 #endif // ENABLE_SCENT

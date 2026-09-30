@@ -76,6 +76,7 @@ private:
     bool _otaRequested = false;
     void performOTAUpdate();
     bool downloadAndInstall(const char* url, int updateType, const char* label);
+    size_t _bytesWritten = 0;  // Written by the last downloadAndInstall() call
     #endif
 };
 

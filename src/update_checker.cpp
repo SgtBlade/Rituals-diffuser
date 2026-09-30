@@ -12,6 +12,7 @@
     #include <HTTPClient.h>
     #include <WiFiClientSecure.h>
     #include <Update.h>
+    #include "filesystem.h"
 #endif
 
 UpdateChecker updateChecker;
@@ -314,6 +315,7 @@ void UpdateChecker::startOTAUpdate() {
 }
 
 bool UpdateChecker::downloadAndInstall(const char* url, int updateType, const char* label) {
+    _bytesWritten = 0;
     logger.infof("Downloading %s from: %s", label, url);
 
     WiFiClientSecure client;
@@ -374,6 +376,7 @@ bool UpdateChecker::downloadAndInstall(const char* url, int updateType, const ch
             }
 
             written += bytesRead;
+            _bytesWritten = written;
             lastDataTime = millis();
             _info.downloadProgress = (written * 100) / contentLength;
 
@@ -432,7 +435,12 @@ void UpdateChecker::performOTAUpdate() {
         _info.downloadProgress = 0;
         if (_stateCallback) _stateCallback();
 
-        if (!downloadAndInstall(_info.spiffsUrl, U_SPIFFS, "SPIFFS")) {
+        // Unmount and mark the partition; a failed or interrupted download
+        // leaves it erased (recovery page) instead of half-written
+        fsUpdateStart();
+        bool fsOk = downloadAndInstall(_info.spiffsUrl, U_SPIFFS, "SPIFFS");
+        fsUpdateEnd(fsOk, _bytesWritten);
+        if (!fsOk) {
             // SPIFFS failed, but firmware was already installed
             // Log warning but still restart to apply firmware
             logger.warn("SPIFFS update failed, but firmware was installed");

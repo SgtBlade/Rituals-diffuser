@@ -32,6 +32,25 @@ public:
     // RPM (only available on ESP32 with tacho)
     uint16_t getRPM();
 
+    // Fan output is on but the tachometer shows no rotation
+    bool isStalled() { return _stalled; }
+
+    // Auto-off failsafe: switch off after this many hours without interaction
+    // (no effect while a timer is set)
+    void setAutoOffHours(uint8_t hours);
+    uint8_t getAutoOffHours() { return _autoOffHours; }
+    // Minutes until the failsafe switches the fan off (0 = not pending)
+    uint16_t getAutoOffRemainingMinutes();
+
+    // PWM output is driving the fan right now (false when off, in an
+    // interval pause, or during calibration/diagnostics)
+    bool isOutputOn() { return _outputOn; }
+
+    // Cartridge usage: full-speed seconds the fan has blown since the last
+    // call (100% counts fully, 1% counts as zero, linear in between). The
+    // remainder below one second is kept for the next call.
+    uint32_t takeFullSpeedSeconds();
+
     // Runtime statistics
     uint32_t getSessionRuntimeMinutes();
     uint32_t getTotalRuntimeMinutes();
@@ -62,6 +81,24 @@ private:
     static void IRAM_ATTR tachoISR();
     unsigned long _lastRpmCalc = 0;
     uint16_t _rpm = 0;
+
+    // Auto-off failsafe
+    uint8_t _autoOffHours = AUTO_OFF_DEFAULT_HOURS;
+    unsigned long _lastInteraction = 0;
+    void touch() { _lastInteraction = millis(); }
+
+    // Stall detection
+    bool _outputOn = false;             // PWM output is driving the fan
+    unsigned long _outputOnSince = 0;
+    uint8_t _lowRpmSamples = 0;
+    bool _stalled = false;
+    void checkStall();
+
+    // Cartridge usage: weighted drive time in ms * (percent - 1)
+    uint64_t _usageWeightedMs = 0;
+    unsigned long _lastUsageTick = 0;
+    uint8_t _outputPercent = 0;
+    void accumulateUsage(unsigned long now);
 
     // Soft start
     unsigned long _softStartTime = 0;

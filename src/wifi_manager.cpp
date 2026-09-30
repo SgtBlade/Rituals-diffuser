@@ -11,6 +11,13 @@ void WiFiManager::begin() {
     _ssid[0] = '\0';
     _password[0] = '\0';
     generateAPName();
+    // DHCP hostname, so the router lists the diffuser by name. Must be set
+    // before the station interface starts.
+#ifdef PLATFORM_ESP8266
+    WiFi.hostname(OTA_HOSTNAME);
+#else
+    WiFi.setHostname(OTA_HOSTNAME);
+#endif
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
 
@@ -20,6 +27,11 @@ void WiFiManager::begin() {
     // Disable WiFi power saving for more stable connection
     esp_wifi_set_ps(WIFI_PS_NONE);
     Serial.println("[WIFI] TX power set to max, power saving disabled");
+    // With several APs broadcasting the same SSID, the default fast scan joins
+    // the first match found (lowest channel), not the strongest one. Scan all
+    // channels and pick the AP with the best signal instead.
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
 #endif
 
     // Check if WiFi is already connected (can happen after OTA update/restart
@@ -44,7 +56,10 @@ void WiFiManager::loop() {
                 setState(WifiStatus::CONNECTED);
                 Serial.printf("[WIFI] Connected to %s\n", _ssid);
                 Serial.printf("[WIFI] IP: %s\n", WiFi.localIP().toString().c_str());
-                logger.infof("WiFi connected: %s (%s)", _ssid, WiFi.localIP().toString().c_str());
+                Serial.printf("[WIFI] AP: %s (ch %d), RSSI: %d dBm\n",
+                              WiFi.BSSIDstr().c_str(), (int)WiFi.channel(), (int)WiFi.RSSI());
+                logger.infof("WiFi connected: %s (%s) via %s, %d dBm", _ssid,
+                             WiFi.localIP().toString().c_str(), WiFi.BSSIDstr().c_str(), (int)WiFi.RSSI());
             } else if (now - _connectStartTime >= WIFI_CONNECT_TIMEOUT) {
                 _reconnectAttempts++;
                 Serial.printf("[WIFI] Connection timeout (attempt %d/%d)\n", _reconnectAttempts, MAX_RECONNECT_ATTEMPTS);
@@ -67,6 +82,9 @@ void WiFiManager::loop() {
                 logger.error("WiFi connection lost");
                 setState(WifiStatus::DISCONNECTED);
                 _lastReconnectAttempt = now;
+            }
+            else {
+                checkRoaming(now);
             }
             break;
 
@@ -248,6 +266,97 @@ int8_t WiFiManager::getRSSI() {
     return 0;
 }
 
+String WiFiManager::getBSSID() {
+    if (_state == WifiStatus::CONNECTED) {
+        return WiFi.BSSIDstr();
+    }
+    return String();
+}
+
+int32_t WiFiManager::getChannel() {
+    if (_state == WifiStatus::CONNECTED) {
+        return WiFi.channel();
+    }
+    return 0;
+}
+
+// Periodically look for a clearly stronger AP with the same SSID while the
+// current signal is weak. Neither the ESP32 nor the ESP8266 roams on its own:
+// once associated it stays with the same AP until the link drops completely.
+void WiFiManager::checkRoaming(unsigned long now) {
+    extern volatile bool otaInProgress;
+
+    if (_roamScanActive) {
+        int16_t n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_RUNNING) return;
+        _roamScanActive = false;
+        if (n < 0) return;  // scan failed
+
+        int8_t currentRssi = WiFi.RSSI();
+        uint8_t currentBssid[6];
+        memcpy(currentBssid, WiFi.BSSID(), 6);
+
+        int best = -1;
+        int32_t bestRssi = -127;
+        for (int16_t i = 0; i < n; i++) {
+            if (WiFi.SSID(i) != _ssid) continue;
+            if (memcmp(WiFi.BSSID(i), currentBssid, 6) == 0) continue;
+            if (WiFi.RSSI(i) > bestRssi) {
+                bestRssi = WiFi.RSSI(i);
+                best = i;
+            }
+        }
+
+        if (best >= 0 && !otaInProgress && bestRssi >= currentRssi + WIFI_ROAM_MIN_GAIN) {
+            uint8_t bssid[6];
+            memcpy(bssid, WiFi.BSSID(best), 6);
+            int32_t channel = WiFi.channel(best);
+            Serial.printf("[WIFI] Roaming: %d dBm -> %s (ch %d, %d dBm)\n",
+                          currentRssi, WiFi.BSSIDstr(best).c_str(), (int)channel, (int)bestRssi);
+            logger.infof("WiFi roaming to %s (%d -> %d dBm)",
+                         WiFi.BSSIDstr(best).c_str(), currentRssi, (int)bestRssi);
+            WiFi.scanDelete();
+#ifdef PLATFORM_ESP8266
+            // The ESP8266 begin() does not leave the current AP by itself.
+            // Use the SDK call: WiFi.disconnect() would also erase the
+            // stored credentials.
+            wifi_station_disconnect();
+#endif
+            // A config with a different BSSID makes begin() join the requested
+            // AP (on ESP32 it also drops the current one). If that AP fails,
+            // the normal reconnect path calls begin() without BSSID again.
+            WiFi.begin(_ssid, _password, channel, bssid);
+            _connectStartTime = now;
+            setState(WifiStatus::CONNECTING);
+            return;
+        }
+        WiFi.scanDelete();
+        return;
+    }
+
+    if (otaInProgress) return;
+    if (now - _connectedSince < WIFI_ROAM_SETTLE_TIME) return;
+    if (now - _lastRoamCheck < WIFI_ROAM_CHECK_INTERVAL) return;
+    _lastRoamCheck = now;
+
+    if (WiFi.RSSI() >= WIFI_ROAM_RSSI_THRESHOLD) return;
+
+#ifdef PLATFORM_ESP8266
+    // Scan results are kept on the heap until scanDelete()
+    if (ESP.getFreeHeap() < 8192) return;
+    // Async scan (the ESP8266 has no per-channel dwell time setting)
+    if (WiFi.scanNetworks(true, false) == WIFI_SCAN_RUNNING) {
+        _roamScanActive = true;
+    }
+#else
+    // Async scan; a short dwell time per channel keeps the interruption of
+    // the current connection small
+    if (WiFi.scanNetworks(true, false, false, 120) == WIFI_SCAN_RUNNING) {
+        _roamScanActive = true;
+    }
+#endif
+}
+
 String WiFiManager::getMacAddress() {
     return WiFi.macAddress();
 }
@@ -263,6 +372,12 @@ void WiFiManager::onStateChange(StateChangeCallback callback) {
 void WiFiManager::setState(WifiStatus state) {
     if (_state != state) {
         _state = state;
+        if (state == WifiStatus::CONNECTED) {
+            _connectedSince = millis();
+        } else if (_roamScanActive) {
+            WiFi.scanDelete();
+            _roamScanActive = false;
+        }
         if (_callback) {
             _callback(state);
         }

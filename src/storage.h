@@ -42,10 +42,16 @@ struct DiffuserSettings {
     uint8_t nightModeEnd;    // Hour (0-23)
     uint8_t nightModeBrightness;  // LED brightness during night (0-100)
 
-    // Reserved (v6): formerly update checker cache, currently unused.
-    // Kept so the EEPROM layout (and everyone's saved settings) stays valid.
-    char reservedVersion[16];
-    bool reservedFlag;
+    // Auto-off failsafe in hours (1..AUTO_OFF_MAX_HOURS, 0 = default).
+    // v7: first byte of the former reservedVersion[16] (update checker cache).
+    uint8_t autoOffHours;
+    // Reserved: rest of the former reservedVersion. Kept so the EEPROM layout
+    // (and everyone's saved settings) stays valid.
+    char reserved[15];
+    // Write cartridge usage (NFC pages 6/7) back to the tag, like the original
+    // firmware. v7: was reservedFlag (formerly updateAvailable), cleared on
+    // migration from v6 so it starts disabled.
+    bool rfidWriteUsage;
 };
 
 // Magic number for valid settings validation
@@ -57,7 +63,10 @@ struct DiffuserSettings {
 // v4 (0x04): Added night mode and runtime stats
 // v5 (0x05): Removed unused sessionStartTime field
 // v6 (0x06): Added update checker fields
-#define SETTINGS_MAGIC 0xD1FF0006
+// v7 (0x07): reservedFlag became rfidWriteUsage, reservedVersion[0] became
+//            autoOffHours (same layout, migrated from v6)
+#define SETTINGS_MAGIC 0xD1FF0007
+#define SETTINGS_MAGIC_V6 0xD1FF0006
 
 class Storage {
 public:
@@ -97,6 +106,14 @@ public:
     bool isNightModeEnabled();
     bool isNightModeActive(uint8_t currentHour);
     uint8_t getNightModeBrightness();
+
+    // Auto-off failsafe (hours without interaction)
+    void setAutoOffHours(uint8_t hours);
+    uint8_t getAutoOffHours() { return _settings.autoOffHours; }
+
+    // Cartridge usage write-back (NFC pages 6/7)
+    void setRfidWriteUsage(bool enabled);
+    bool isRfidWriteUsage() { return _settings.rfidWriteUsage; }
 
     // Check if WiFi is configured
     bool hasWiFiCredentials();

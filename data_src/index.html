@@ -2,13 +2,23 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#2a2119">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Diffuser">
 <title>Rituals Diffuser</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" type="image/png" href="icon-192.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div class="bg" aria-hidden="true"></div>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<symbol id="logo" viewBox="38 38 214 252"><g fill="none" stroke="currentColor" stroke-width="7.5"><path d="M52 45V85M52 48.75H67.5a8.9 8.9 0 0 1 0 17.8H43.5M64 66.5L80.5 85M144.5 45V85M212.5 48.75H243.5M228 48.75V85M52 124V146a13.75 13.75 0 0 0 27.5 0V124M130 164L144.5 125L159 164M136.5 152.5H152.5M129.5 128.75H144M216.25 124V160.25H243.5M239.75 147V164M78.5 207.5C74 201 54 199 52 210.5C50 222 80 215 80.5 229.5C81 243 56 244 49 233.5"/></g><g fill="currentColor"><circle cx="156" cy="231" r="6"/><circle cx="196.5" cy="231" r="6"/><circle cx="237" cy="231" r="6"/><text x="43.5" y="276" textLength="195" lengthAdjust="spacing" font-family="Futura,'Avenir Next',Avenir,'Century Gothic','Helvetica Neue',Arial,sans-serif" font-size="23" font-weight="500">CUSTOM</text></g></symbol>
 <symbol id="i-drop" viewBox="0 0 24 24"><path d="M12 3c3.5 4.2 6 7.4 6 10.5a6 6 0 0 1-12 0C6 10.4 8.5 7.2 12 3z"/></symbol>
 <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></symbol>
 <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></symbol>
@@ -30,17 +40,19 @@
 
 <div class="app">
 <nav class="tabs" aria-label="Main">
-<div class="brand"><b>Rituals Diffuser</b><small class="version">v--</small></div>
+<div class="brand"><svg class="logo" viewBox="0 0 214 252" role="img" aria-label="Rituals custom"><use href="#logo" width="214" height="252"/></svg><small class="version">v--</small></div>
 <a href="#control" data-view="control"><svg class="i"><use href="#i-drop"/></svg>Control</a>
-<a href="#settings" data-view="settings"><svg class="i"><use href="#i-sliders"/></svg>Settings</a>
-<a href="#firmware" data-view="firmware"><svg class="i"><use href="#i-up"/></svg>Firmware<span id="fw-badge" class="tab-dot hidden"></span></a>
+<a href="#settings" data-view="settings"><svg class="i"><use href="#i-sliders"/></svg>Settings<span id="fw-badge" class="tab-dot hidden"></span></a>
 </nav>
 
 <main>
 <!-- ================= CONTROL ================= -->
 <section id="v-control" class="view">
 <header class="top">
-<div><h1 id="dev-name">Rituals Diffuser</h1><span class="muted version-line"><span class="version">v--</span> · <span id="platform">--</span></span></div>
+<div class="brand-logo"><svg class="logo" viewBox="0 0 214 252" role="img" aria-label="Rituals custom"><use href="#logo" width="214" height="252"/></svg></div>
+<span class="eyebrow">Diffuser</span>
+<h1 id="dev-name">Rituals Diffuser</h1>
+<span class="muted version-line"><span class="version">v--</span> · <span id="platform">--</span></span>
 <div class="pills"><span class="pill"><span id="wifi-dot" class="dot"></span><span id="wifi-label">WiFi</span></span><span class="pill"><span id="mqtt-dot" class="dot"></span>MQTT</span></div>
 </header>
 
@@ -58,9 +70,10 @@
 <div class="ring-in"><span class="label">Fan speed</span><span class="big"><span id="speed-val">50</span><small>%</small></span><span class="muted sm" id="rpm-text">-- rpm</span></div>
 </div>
 <input type="range" id="speed" min="0" max="100" value="50" aria-label="Fan speed">
+<div class="scale"><span>SOFT</span><span>INTENSE</span></div>
 <div class="hero-foot">
 <div><b id="state-title">--</b><span class="muted sm" id="state-sub"></span></div>
-<button id="power" class="power" aria-label="Turn diffuser on"><svg class="i"><use href="#i-power"/></svg></button>
+<button id="power" class="power" aria-label="Turn diffuser on"><svg class="i"><use href="#i-power"/></svg><span id="power-text">Turn on</span></button>
 </div>
 </div>
 
@@ -74,8 +87,9 @@
 <div class="card">
 <div class="card-head"><h2>Timer</h2><span class="muted sm" id="remaining"></span></div>
 <div class="chips">
-<button class="chip" data-t="30">30m</button><button class="chip" data-t="60">60m</button><button class="chip" data-t="90">90m</button><button class="chip" data-t="120">120m</button><button class="chip" data-t="0" aria-label="Continuous">∞</button>
+<button class="chip" data-t="30">30m</button><button class="chip" data-t="60">60m</button><button class="chip" data-t="90">90m</button><button class="chip" data-t="120">120m</button><button class="chip" data-t="0" aria-label="No timer, turns off automatically">Auto</button>
 </div>
+<label class="field">Without a timer, turn off after<select id="auto-off"><option value="1">1 hour</option><option value="2">2 hours</option><option value="3">3 hours</option><option value="4">4 hours</option></select></label>
 </div>
 
 <div class="card">
@@ -92,7 +106,8 @@
 
 <!-- ================= SETTINGS ================= -->
 <section id="v-settings" class="view hidden">
-<h1 class="page-title">Settings</h1>
+<span class="eyebrow">Settings</span>
+<h1 class="page-title">My Diffuser</h1>
 
 <h3 class="label group">Connection</h3>
 <div class="card list">
@@ -124,6 +139,17 @@
 <div class="two"><label class="field">From<select id="night-start"></select></label><label class="field">Until<select id="night-end"></select></label></div>
 <label class="field"><span class="split"><span>Brightness at night</span><b id="night-bright-val">10%</b></span><input type="range" id="night-bright" min="0" max="100" value="10"></label>
 <button id="save-night" class="btn">Save</button>
+</div>
+</details>
+</div>
+
+<h3 class="label group">Cartridge</h3>
+<div class="card list">
+<details class="row" id="cart-row">
+<summary><span class="ico"><svg class="i"><use href="#i-drop"/></svg></span><span class="grow"><b>Save usage on cartridge</b><span class="muted sm" id="cart-sum">--</span></span><svg class="i chev"><use href="#i-chev"/></svg></summary>
+<div class="body">
+<div class="card-head"><span>Write usage to the cartridge tag</span><label class="sw"><input type="checkbox" role="switch" id="cart-write" aria-label="Save usage on cartridge"><span></span></label></div>
+<p class="muted sm">Stores the minutes at full speed and the first-use date on the cartridge, in the same format as the original Rituals firmware, so the usage moves with the cartridge. Only these two values are written; the scent code is never changed.</p>
 </div>
 </details>
 </div>
@@ -186,6 +212,7 @@
 
 <!-- ================= FIRMWARE ================= -->
 <section id="v-firmware" class="view hidden">
+<a href="#settings" class="back"><svg class="i"><use href="#i-chev"/></svg>Settings</a>
 <h1 class="page-title">Firmware</h1>
 <div class="card">
 <div class="two">

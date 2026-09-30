@@ -119,6 +119,21 @@
 #define FAN_MIN_SPEED       0       // Minimum speed (0%)
 #define FAN_MAX_SPEED       100     // Maximum speed (100%)
 #define FAN_SOFT_START_MS   500     // Soft start duration
+
+// Auto-off failsafe: without a timer the fan switches off after this many
+// hours without any interaction (web, MQTT, button), so a forgotten diffuser
+// doesn't empty a cartridge. Configurable 1..4 hours.
+#define AUTO_OFF_DEFAULT_HOURS  4
+#define AUTO_OFF_MAX_HOURS      4
+#ifndef AUTO_OFF_UNIT_MS
+#define AUTO_OFF_UNIT_MS        3600000UL   // One "hour" (overridable for tests)
+#endif
+
+// Stall detection: the fan output is on but the tachometer shows (almost) no
+// rotation. Checked once per RPM sample after a spin-up grace period.
+#define FAN_STALL_RPM       200     // Below this the fan counts as not turning
+#define FAN_STALL_GRACE_MS  3000    // Spin-up time after the output switches on
+#define FAN_STALL_SAMPLES   5       // Consecutive low samples (1 s each) before reporting
 #define FAN_SPEED_SAVE_DELAY_MS 5000 // Persist speed only after it stopped changing (flash wear)
 
 // ===========================================
@@ -152,6 +167,14 @@
 #define WIFI_AP_PASSWORD        "diffuser123"
 #define WIFI_CONNECT_TIMEOUT    30000           // 30 seconds
 #define WIFI_RECONNECT_INTERVAL 60000           // 1 minute
+
+// Roaming between access points sharing the same SSID.
+// While the signal is weaker than the threshold, scan periodically and
+// switch to another AP of the same network if it is clearly stronger.
+#define WIFI_ROAM_RSSI_THRESHOLD  -67           // dBm
+#define WIFI_ROAM_MIN_GAIN        10            // dB better than the current AP
+#define WIFI_ROAM_CHECK_INTERVAL  180000        // 3 minutes
+#define WIFI_ROAM_SETTLE_TIME     60000         // no roam check within 1 min after connecting
 
 // ===========================================
 // MQTT Settings
@@ -197,6 +220,8 @@
 #define NVS_NIGHT_START         "night_start"
 #define NVS_NIGHT_END           "night_end"
 #define NVS_NIGHT_BRIGHT        "night_bri"
+#define NVS_RFID_WRITE          "rfid_write"
+#define NVS_AUTO_OFF            "auto_off"
 
 // ===========================================
 // LED Colors (RGB)
@@ -226,7 +251,7 @@
 // ===========================================
 // Firmware Version (centralized)
 // ===========================================
-#define FIRMWARE_VERSION        "1.11.0"
+#define FIRMWARE_VERSION        "2.0.0"
 
 // ===========================================
 // Update Checker Settings

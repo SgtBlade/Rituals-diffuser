@@ -32,19 +32,65 @@ void stopAsyncWebServer() {
     webServer.stop();
 }
 
+// Filesystem (LittleFS on ESP8266, SPIFFS on ESP32), shared with logger.cpp
+#include "filesystem.h"
+
 #ifdef PLATFORM_ESP8266
-    #include <LittleFS.h>
-    // Use LittleFS on ESP8266 (same as logger.cpp to avoid mounting two filesystems)
-    #define FILESYSTEM LittleFS
     #define FS_IMAGE_NAME "littlefs_esp8266.bin"
     // Firmware/filesystem uploads: see sync_ota.cpp (Safe Update mode)
 #else
-    #include <SPIFFS.h>
     #include <Update.h>
-    #define FILESYSTEM SPIFFS
     #define UPDATE_ERROR_STRING() Update.errorString()
-    #define FS_IMAGE_NAME "spiffs_esp32.bin"
+    #if defined(CONFIG_IDF_TARGET_ESP32C3)
+        #define FS_IMAGE_NAME "spiffs_esp32c3.bin"
+    #else
+        #define FS_IMAGE_NAME "spiffs_esp32.bin"
+    #endif
 #endif
+
+// Shown instead of the web interface when its files are missing or damaged,
+// e.g. after an interrupted filesystem upload. Lets the filesystem image be
+// uploaded again over WiFi.
+static const char RECOVERY_PAGE[] PROGMEM =
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<meta name='color-scheme' content='light dark'>"
+    "<title>Rituals Diffuser</title><style>"
+    "body{font:15px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;max-width:480px;margin:0 auto;padding:32px 16px}"
+    "h1{font-size:24px;margin:0 0 4px}.m{opacity:.7;margin:0 0 20px}"
+    ".w{border:1px solid #D92D20;border-radius:10px;padding:12px 14px;margin-bottom:16px}"
+    "input,button{display:block;width:100%;box-sizing:border-box;font:inherit;margin:8px 0}"
+    "button{height:44px;border:0;border-radius:8px;background:#2563EB;color:#fff;font-weight:600;cursor:pointer}"
+    "button:disabled{opacity:.5}progress{width:100%}"
+    "</style></head><body>"
+    "<h1>Rituals Diffuser</h1><p class='m'>Firmware v" FIRMWARE_VERSION "</p>"
+    "<div class='w'><b>Web interface files are missing or damaged.</b><br>"
+    "The diffuser itself keeps working (buttons, MQTT, API).</div>"
+#ifdef PLATFORM_ESP8266
+    "<p>Start Safe Update mode and upload <b>" FS_IMAGE_NAME "</b> as filesystem image, "
+    "from the release that matches this firmware.</p>"
+    "<button id='b'>Start Safe Update mode</button><p id='s'></p>"
+    "<script>b.onclick=function(){b.disabled=true;s.textContent='Starting...';"
+    "fetch('/api/ota/prepare',{method:'POST'}).then(function(){"
+    "setTimeout(function(){location.href='/'},4000)})"
+    ".catch(function(){b.disabled=false;s.textContent='Failed, try again'})}</script>"
+#else
+    "<p>Upload <b>" FS_IMAGE_NAME "</b> from the release that matches this firmware "
+    "to restore the web interface.</p>"
+    "<input type='file' id='f' accept='.bin'><button id='b'>Upload filesystem</button>"
+    "<progress id='p' max='100' value='0' hidden></progress><p id='s'></p>"
+    "<script>b.onclick=function(){var file=f.files[0];"
+    "if(!file){s.textContent='Choose a file first';return}"
+    "var d=new FormData();d.append('file',file);var x=new XMLHttpRequest();"
+    "x.upload.onprogress=function(e){p.hidden=false;p.value=e.loaded*100/e.total};"
+    "x.onload=function(){if(x.status==200){s.textContent='Done. Restarting...';"
+    "setTimeout(function(){location.reload()},12000)}"
+    "else{b.disabled=false;s.textContent='Upload failed: '+x.responseText}};"
+    "x.onerror=function(){b.disabled=false;s.textContent='Connection lost, try again'};"
+    "b.disabled=true;s.textContent='Uploading...';"
+    "x.open('POST','/api/update/filesystem');x.send(d)}</script>"
+#endif
+    "</body></html>";
 
 // CSRF protection for state-changing requests. Browsers always send an Origin
 // (or at least Referer) header on cross-site POST/DELETE requests, including
@@ -89,13 +135,10 @@ void WebServer::begin() {
         return;
     }
 
-    // Initialize filesystem (LittleFS on ESP8266, SPIFFS on ESP32)
-#ifdef PLATFORM_ESP8266
-    if (!FILESYSTEM.begin()) {
-#else
-    if (!FILESYSTEM.begin(true)) {
-#endif
-        Serial.println("[WEB] Filesystem mount failed");
+    // Filesystem is normally mounted by the logger already; without it the
+    // server still runs (API + recovery page)
+    if (!fsBegin()) {
+        Serial.println("[WEB] Filesystem unavailable");
     }
 
     _server = new AsyncWebServer(WEBSERVER_PORT);
@@ -220,8 +263,9 @@ void WebServer::abortUpload() {
         _updateBegun = false;
     }
     if (_uploadIsFilesystem) {
-        // Remount without formatting - a half-written image must not be wiped
-        FILESYSTEM.begin(false);
+        // Partition untouched: remount as it was. Partially written: it
+        // holds half an image, so it is erased and formatted instead.
+        fsUpdateEnd(false, _uploadBytes);
     }
     _uploadActive = false;
     _uploadRequest = nullptr;
@@ -257,6 +301,7 @@ void WebServer::handleUploadChunk(AsyncWebServerRequest* request, bool filesyste
         _uploadFailed = false;
         _updateBegun = false;
         _uploadIsFilesystem = filesystem;
+        _uploadBytes = 0;
         _lastUploadActivity = millis();
         _uploadStartPending = true;   // loop(): MQTT off, fan off, LED
 
@@ -272,7 +317,7 @@ void WebServer::handleUploadChunk(AsyncWebServerRequest* request, bool filesyste
 
         if (filesystem) {
             // Unmount so nothing writes into the partition being replaced
-            FILESYSTEM.end();
+            fsUpdateStart();
             _updateBegun = Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS);
         } else {
             _updateBegun = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
@@ -294,15 +339,22 @@ void WebServer::handleUploadChunk(AsyncWebServerRequest* request, bool filesyste
         return;  // Drain the rest of the body; handleUploadDone() reports the error
     }
 
-    if (len && Update.write(data, len) != len) {
-        Serial.printf("[OTA] Update.write failed: %s\n", UPDATE_ERROR_STRING());
-        _uploadFailed = true;
-        return;
+    if (len) {
+        size_t written = Update.write(data, len);
+        _uploadBytes += written;
+        if (written != len) {
+            Serial.printf("[OTA] Update.write failed: %s\n", UPDATE_ERROR_STRING());
+            _uploadFailed = true;
+            return;
+        }
     }
 
     if (final) {
         if (Update.end(true)) {
             _updateBegun = false;  // Finished - nothing left to abort
+            if (_uploadIsFilesystem) {
+                fsUpdateEnd(true, _uploadBytes);
+            }
             Serial.printf("[OTA] Update success: %u bytes\n", index + len);
         } else {
             Serial.printf("[OTA] Update failed: %s\n", UPDATE_ERROR_STRING());
@@ -353,6 +405,35 @@ void WebServer::setupRoutes() {
     _server->on("/api/status", HTTP_GET, [this](AsyncWebServerRequest* request) {
         handleStatus(request);
     });
+
+    #if defined(RC522_ENABLED) && !defined(PLATFORM_ESP8266)
+    // Read-only raw tag pages of the current cartridge, for research
+    _server->on("/api/rfid/pages", HTTP_GET, [](AsyncWebServerRequest* request) {
+        StaticJsonDocument<640> doc;
+        doc["uid"] = rfidGetLastUID();
+        doc["pages"] = rfidGetLastPagesHex();
+        String json;
+        serializeJson(doc, json);
+        request->send(200, "application/json", json);
+    });
+    #endif
+
+    #if defined(RC522_ENABLED)
+    // Cartridge settings: write usage back to the tag (pages 6/7)
+    _server->on("/api/rfid/settings", HTTP_POST, [](AsyncWebServerRequest* request) {
+        if (rejectCrossSite(request)) return;
+        LOCK_OR_503(request);
+        if (!request->hasParam("write_usage", true)) {
+            request->send(400, "application/json", "{\"error\":\"Missing write_usage\"}");
+            return;
+        }
+        const String& v = request->getParam("write_usage", true)->value();
+        bool enabled = (v == "1" || v == "true" || v == "on");
+        storage.setRfidWriteUsage(enabled);
+        logger.infof("Cartridge usage write-back %s", enabled ? "enabled" : "disabled");
+        request->send(200, "application/json", enabled ? "{\"write_usage\":true}" : "{\"write_usage\":false}");
+    });
+    #endif
 
     _server->on("/api/wifi", HTTP_POST, [this](AsyncWebServerRequest* request) {
         handleSaveWifi(request);
@@ -541,28 +622,29 @@ void WebServer::setupRoutes() {
 
     // Static files last: the static handler hits the filesystem for every
     // request it is asked about, so API routes must be matched before it.
-    _server->serveStatic("/", FILESYSTEM, "/").setDefaultFile("index.html");
+    // Only while the web interface is complete: during a filesystem update or
+    // with missing files the requests fall through to the recovery page.
+    _server->serveStatic("/", FILESYSTEM, "/")
+        .setDefaultFile("index.html")
+        .setFilter([](AsyncWebServerRequest*) { return fsHasWebUi(); });
 
-    // Captive portal redirect - only in AP mode, redirect to config page
     _server->onNotFound([](AsyncWebServerRequest* request) {
-        // Only redirect GET requests in AP mode for captive portal
-        if (request->method() == HTTP_GET && wifiManager.isAPMode()) {
-            // Don't redirect if already requesting root (prevents infinite loop if index.html missing)
+        if (request->method() == HTTP_GET) {
             String url = request->url();
-            if (url == "/" || url == "/index.html") {
-                // Filesystem probably missing - send error page
-                request->send(200, "text/html",
-                    "<html><body style='font-family:sans-serif;text-align:center;padding:50px;'>"
-                    "<h1>Rituals Diffuser</h1>"
-                    "<p>Web interface files missing!</p>"
-                    "<p>Please flash <b>" FS_IMAGE_NAME "</b> to the device.</p>"
-                    "</body></html>");
-            } else {
-                request->redirect("http://192.168.4.1/");
+            // Web interface missing: recovery page with filesystem upload
+            if (!fsHasWebUi() && (url == "/" || url == "/index.html" || url == "/update.html")) {
+                AsyncWebServerResponse* response = request->beginResponse_P(200, "text/html", RECOVERY_PAGE);
+                response->addHeader("Cache-Control", "no-store");
+                request->send(response);
+                return;
             }
-        } else {
-            request->send(404);
+            // Captive portal: redirect everything else to the config page
+            if (wifiManager.isAPMode()) {
+                request->redirect("http://192.168.4.1/");
+                return;
+            }
         }
+        request->send(404);
     });
 }
 
@@ -584,9 +666,9 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     // can occasionally push past 1408; ESP8266 keeps the smaller budget with the
     // low-heap 503 guard above as a safety net.
 #ifdef PLATFORM_ESP8266
-    DynamicJsonDocument doc(1408);
+    DynamicJsonDocument doc(1472);
 #else
-    DynamicJsonDocument doc(1536);
+    DynamicJsonDocument doc(1728);
 #endif
 
     // WiFi status
@@ -595,6 +677,10 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     doc["wifi"]["ssid"] = wifiManager.getSSID();
     doc["wifi"]["ip"] = wifiManager.getIP();
     doc["wifi"]["rssi"] = wifiManager.getRSSI();
+#ifndef PLATFORM_ESP8266
+    doc["wifi"]["bssid"] = wifiManager.getBSSID();
+    doc["wifi"]["channel"] = wifiManager.getChannel();
+#endif
 
     // MQTT status
     doc["mqtt"]["connected"] = mqttHandler.isConnected();
@@ -605,6 +691,9 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     doc["fan"]["on"] = fanController.isOn();
     doc["fan"]["speed"] = fanController.getSpeed();
     doc["fan"]["rpm"] = fanController.getRPM();
+    doc["fan"]["stalled"] = fanController.isStalled();
+    doc["fan"]["auto_off_hours"] = fanController.getAutoOffHours();
+    doc["fan"]["auto_off_minutes"] = fanController.getAutoOffRemainingMinutes();
     doc["fan"]["timer_active"] = fanController.isTimerActive();
     doc["fan"]["remaining_minutes"] = fanController.getRemainingMinutes();
     doc["fan"]["interval_mode"] = fanController.isIntervalMode();
@@ -650,7 +739,15 @@ void WebServer::handleStatus(AsyncWebServerRequest* request) {
     doc["rfid"]["last_scent"] = rfidGetLastScent();
     #ifndef PLATFORM_ESP8266
     doc["rfid"]["last_scent_code"] = rfidGetLastScentCode();
+    char legacyCode[12];
+    rfidFormatLegacyCode(rfidGetLastScentCode(), legacyCode, sizeof(legacyCode));
+    doc["rfid"]["legacy_code"] = legacyCode;  // Copied: stack buffer
     #endif
+    // Usage stored on the tag by the original firmware (0 = none)
+    doc["rfid"]["usage_minutes"] = rfidGetUsageMinutes();
+    doc["rfid"]["first_use"] = rfidGetFirstUse();
+    doc["rfid"]["write_usage"] = storage.isRfidWriteUsage();
+    doc["rfid"]["tag_writable"] = rfidIsTagWritable();
     doc["rfid"]["time_since_tag"] = rfidTimeSinceLastTag();
     // Debug info: version register (0x91/0x92/0x88 = valid, 0x00/0xFF = no communication)
     char versionHex[5];
@@ -672,12 +769,15 @@ void WebServer::handleStatusLite(AsyncWebServerRequest* request) {
     // Lite status endpoint for frequent polling - uses StaticJsonDocument on STACK
     // to avoid heap allocation and fragmentation on ESP8266
     // Contains only data needed for UI polling updates
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<448> doc;
 
     // Fan status (essential for UI updates)
     doc["fan"]["on"] = fanController.isOn();
     doc["fan"]["speed"] = fanController.getSpeed();
     doc["fan"]["rpm"] = fanController.getRPM();
+    doc["fan"]["stalled"] = fanController.isStalled();
+    doc["fan"]["auto_off_hours"] = fanController.getAutoOffHours();
+    doc["fan"]["auto_off_minutes"] = fanController.getAutoOffRemainingMinutes();
     doc["fan"]["timer_active"] = fanController.isTimerActive();
     doc["fan"]["remaining_minutes"] = fanController.getRemainingMinutes();
     doc["fan"]["interval_mode"] = fanController.isIntervalMode();
@@ -854,6 +954,14 @@ void WebServer::handleFanControl(AsyncWebServerRequest* request) {
         updateLedStatus();
     }
 
+    if (request->hasParam("auto_off", true)) {
+        int hours = request->getParam("auto_off", true)->value().toInt();
+        if (hours >= 1 && hours <= AUTO_OFF_MAX_HOURS) {
+            fanController.setAutoOffHours(hours);
+            storage.setAutoOffHours(hours);
+        }
+    }
+
     if (request->hasParam("interval", true)) {
         bool interval = request->getParam("interval", true)->value() == "true";
         fanController.setIntervalMode(interval);
@@ -892,6 +1000,8 @@ void WebServer::handleFanControl(AsyncWebServerRequest* request) {
     response["fan"]["speed"] = fanController.getSpeed();
     response["fan"]["timer_active"] = fanController.isTimerActive();
     response["fan"]["remaining_minutes"] = fanController.getRemainingMinutes();
+    response["fan"]["auto_off_hours"] = fanController.getAutoOffHours();
+    response["fan"]["auto_off_minutes"] = fanController.getAutoOffRemainingMinutes();
 
     String output;
     if (serializeJson(response, output) == 0) {

@@ -39,6 +39,8 @@ public:
     String getSSID();
     String getIP();
     int8_t getRSSI();
+    String getBSSID();
+    int32_t getChannel();
     String getMacAddress();
     String getAPName();
 
@@ -66,6 +68,12 @@ private:
     DNSServer _dnsServer;
     static const byte DNS_PORT = 53;
     bool _dnsStarted = false;
+
+    // Roaming to a stronger AP with the same SSID
+    unsigned long _connectedSince = 0;
+    unsigned long _lastRoamCheck = 0;
+    bool _roamScanActive = false;
+    void checkRoaming(unsigned long now);
 
     void setState(WifiStatus state);
     void generateAPName();

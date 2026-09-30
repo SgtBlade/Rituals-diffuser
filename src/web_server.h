@@ -41,6 +41,7 @@ private:
     volatile bool _updateBegun = false;         // Our Update.begin() succeeded and isn't finished
     AsyncWebServerRequest* volatile _uploadRequest = nullptr;  // Request owning the active upload
     volatile bool _uploadIsFilesystem = false;
+    volatile size_t _uploadBytes = 0;             // Bytes written into the partition so far
     volatile bool _uploadStartPending = false;
     volatile bool _uploadAbortPending = false;
     volatile unsigned long _lastUploadActivity = 0;
