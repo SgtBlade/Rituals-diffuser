@@ -259,10 +259,11 @@ bool rfidInit() {
     // Store for debug access via web API
     rc522VersionReg = version;
 
-    if (version == 0x91 || version == 0x92 || version == 0x88) {
+    if (version == 0x91 || version == 0x92 || version == 0x88 || version == 0x82) {
         rc522Connected = true;
         Serial.printf("[RFID] RC522 detected! Firmware version: 0x%02X", version);
         if (version == 0x91) Serial.println(" (v1.0)");
+        else if (version == 0x82) Serial.println(" (v1.0)");
         else if (version == 0x92) Serial.println(" (v2.0)");
         else if (version == 0x88) Serial.println(" (clone)");
         else Serial.println();
